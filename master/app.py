@@ -131,13 +131,27 @@ def create_app(data_dir: Path) -> FastAPI:
         return RedirectResponse(url=f"/?message=Worker+added%3A+{worker_id}", status_code=303)
 
     @app.post("/api/workers/{worker_id}/probe")
-    async def probe_one(worker_id: str) -> RedirectResponse:
+    async def probe_one(worker_id: str) -> dict[str, Any]:
         worker = next((item for item in store.workers() if item["id"] == worker_id), None)
         if worker is None:
             raise HTTPException(404, "Worker not found")
         result = await probe_worker(worker)
-        message = "Worker+is+online" if result["online"] else "Worker+is+offline"
-        return RedirectResponse(url=f"/?message={message}", status_code=303)
+        return {"online": bool(result["online"]), "queue_count": result["queue_count"],
+                "last_check": result["last_check"], "error": result["health_error"]}
+
+    @app.post("/api/workers/{worker_id}/edit")
+    async def edit_worker(worker_id: str, name: str = Form(...), url: str = Form(...), token: str = Form("")) -> RedirectResponse:
+        with store.connect() as con:
+            existing = con.execute("SELECT id FROM workers WHERE id = ?", (worker_id,)).fetchone()
+            if existing is None:
+                raise HTTPException(404, "Worker not found")
+            if token:
+                con.execute("UPDATE workers SET name = ?, url = ?, token = ? WHERE id = ?",
+                            (name, url.rstrip("/"), token, worker_id))
+            else:
+                con.execute("UPDATE workers SET name = ?, url = ? WHERE id = ?",
+                            (name, url.rstrip("/"), worker_id))
+        return RedirectResponse(url="/?message=Worker+updated", status_code=303)
 
     @app.post("/api/workers/{worker_id}/delete")
     async def delete_worker(worker_id: str) -> RedirectResponse:
