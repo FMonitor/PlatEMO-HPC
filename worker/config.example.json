@@ -2,7 +2,10 @@
   "platemo_root": "H:\\PlatEMO",
   "matlab_exe": "H:\\Matlab\\bin\\matlab.exe",
   "data_dir": "Data",
-  "worker_token": "change-this-before-exposing-on-zerotier",
+  "worker_name": "worker-01",
+  "worker_url": "http://WORKER_ZEROTIER_IP:6001",
+  "master_join_token": "copy-the-token-from-master-settings-or-startup",
+  "node_token": "",
   "master_url": "http://MASTER_ZEROTIER_IP:6080",
-  "auto_run": false
+  "auto_run": true
 }

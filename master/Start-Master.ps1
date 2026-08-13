@@ -4,6 +4,7 @@ param(
     [string]$PlatEMOPath = '',
     [string]$HostAddress = '0.0.0.0',
     [int]$Port = 6080,
+    [string]$WorkerJoinToken = '',
     [switch]$SkipInstall
 )
 
@@ -28,5 +29,6 @@ if (-not $SkipInstall -and -not (Test-Path -LiteralPath $installMarker)) {
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
 $arguments = @('-m', 'app', '--data-dir', $DataDir, '--host', $HostAddress, '--port', $Port)
 if ($PlatEMOPath) { $arguments += @('--platemo-path', $PlatEMOPath) }
+if ($WorkerJoinToken) { $arguments += @('--worker-join-token', $WorkerJoinToken) }
 & $python @arguments
 Set-Location -LiteralPath $originalLocation

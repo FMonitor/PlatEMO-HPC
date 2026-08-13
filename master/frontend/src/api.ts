@@ -15,7 +15,7 @@ export const api = {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platemo_path: platemoPath }),
   }),
   workers: () => request<Worker[]>('/api/workers'),
-  tasks: () => request<TaskStatus[]>('/api/tasks'),
+  tasks: () => request<TaskStatus[]>('/api/v1/ui/tasks'),
   previewSetting: (filename: string) => request<ImportedSettings>(`/api/settings/preview?filename=${encodeURIComponent(filename)}`),
   importSetting: (file: File) => {
     const body = new FormData()
@@ -34,15 +34,15 @@ export const api = {
     const response = await fetch('/api/workers/probe-all', { method: 'POST', redirect: 'follow' })
     if (!response.ok) throw new Error(await response.text())
   },
-  addWorker: async (form: { name: string; url: string; token: string }) => {
+  addWorker: async (form: { name: string; url: string; token: string; priority: number }) => {
     const body = new FormData()
-    Object.entries(form).forEach(([key, value]) => body.append(key, value))
+    Object.entries(form).forEach(([key, value]) => body.append(key, String(value)))
     const response = await fetch('/api/workers', { method: 'POST', body, redirect: 'follow' })
     if (!response.ok) throw new Error(await response.text())
   },
-  editWorker: async (id: string, form: { name: string; url: string; token: string }) => {
+  editWorker: async (id: string, form: { name: string; url: string; token: string; priority: number }) => {
     const body = new FormData()
-    Object.entries(form).forEach(([key, value]) => body.append(key, value))
+    Object.entries(form).forEach(([key, value]) => body.append(key, String(value)))
     const response = await fetch(`/api/workers/${id}/edit`, { method: 'POST', body, redirect: 'follow' })
     if (!response.ok) throw new Error(await response.text())
   },
@@ -50,7 +50,7 @@ export const api = {
     const response = await fetch(`/api/workers/${id}/delete`, { method: 'POST', redirect: 'follow' })
     if (!response.ok) throw new Error(await response.text())
   },
-  startMock: async (payload: {
+  startRun: async (payload: {
     algorithms: object[]
     problems: object[]
     runs: number
@@ -65,7 +65,7 @@ export const api = {
     body.append('retain_points', String(payload.retainPoints))
     if (payload.maxWorkers) body.append('max_workers', String(payload.maxWorkers))
     payload.workerIds.forEach((id) => body.append('worker_ids', id))
-    const response = await fetch('/api/mock-runs', { method: 'POST', body, redirect: 'follow' })
+    const response = await fetch('/api/v1/experiments', { method: 'POST', body })
     if (!response.ok) throw new Error(await response.text())
   },
 }

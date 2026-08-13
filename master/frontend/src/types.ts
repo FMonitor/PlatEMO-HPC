@@ -46,6 +46,7 @@ export interface Worker {
   queue_count: number | null
   last_check: string
   health_error: string
+  priority?: number
 }
 
 export interface TaskStatus {
@@ -60,6 +61,9 @@ export interface TaskStatus {
   created_at: string
   updated_at: string
   error: string
+  fe?: number
+  total_fe?: number
+  elapsed_seconds?: number
 }
 
 export interface ImportedSettings {

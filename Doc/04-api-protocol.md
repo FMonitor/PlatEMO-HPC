@@ -1,101 +1,109 @@
-# API 与实时通信协议
+# Master / Worker v1 接口协议
 
-目标版本前缀：`/api/v1`。当前原型为兼容已有 Worker 使用 `/api/*` 路径；在任务租约 API 落地时统一迁移到 v1。所有时间使用 ISO-8601 UTC，所有标识符使用 UUID。Worker API 请求采用 `Authorization: Bearer <node-token>`；UI 采用用户会话或本地管理员 token。
+当前版本只使用 `/api/v1` 调度协议，不保留旧的 Master 主动推送任务接口。所有标识符均为 UUID，时间使用 ISO-8601 UTC。
 
-## Master API
+## 认证与模型
 
-| 方法 | 路径 | 调用方 | 用途 |
-| --- | --- | --- | --- |
-| `POST` | `/workers/register` | Worker | 一次性注册并换取节点密钥 |
-| `POST` | `/workers/{id}/heartbeat` | Worker | 心跳、能力、运行 Attempt 和进度 |
-| `POST` | `/workers/{id}/lease` | Worker | 领取一个 Task 租约 |
-| `POST` | `/tasks/{taskId}/attempts/{attemptId}/progress` | Worker | FE/ETA/日志 offset 上报 |
-| `POST` | `/tasks/{taskId}/attempts/{attemptId}/complete` | Worker | 成功、失败、取消和产物元数据 |
-| `PUT` | `/artifacts/{artifactId}` | Worker | 上传 MAT/日志，支持断点续传 |
-| `GET` | `/api/catalog` | UI | 算法、问题、参数、`Setting*.mat` 与已有测试候选 |
-| `GET` | `/api/tasks` | UI | 最近 100 个任务的 Worker、算法、问题、Seed 与状态 |
-| `PUT` | `/api/platemo-path` | UI | 设置并验证 PlatEMO 根目录 |
-| `POST` | `/experiments` | UI | 创建草稿/快照 |
-| `POST` | `/experiments/{id}/start` | UI | 根据快照生成 Task |
-| `POST` | `/experiments/{id}/cancel` | UI | 停止未开始任务并取消运行任务 |
-| `GET` | `/workers` | UI | Worker 状态、优先级和能力 |
-| `PATCH` | `/workers/{id}` | UI | 名称、优先级、槽位、启停状态 |
-| `GET` | `/api/settings/catalog` | UI | 读取预设文件和已有测试候选 |
-| `GET` | `/api/settings/preview?filename=...` | UI | 预览 PlatEMO `Data/Setting*.mat` |
-| `POST` | `/api/settings/load` | UI | 上传并解析 PlatEMO 或 Master 原生 MAT |
-| `POST` | `/api/settings/save` | UI | 另存为 Master 原生实验配置 MAT |
-| `GET` | `/api/existing-tests` | UI | 返回按算法/问题/M/D 聚合的已有结果 |
-| `GET` | `/events` | UI | 历史事件与审计 |
+Master 启动时生成并持久化 `worker_join_token`。Worker 首次注册使用 Join Token，成功后获得仅属于该节点的 `node_token`；后续心跳、租约、进度、产物和完成确认均使用 `Authorization: Bearer <node_token>`。
 
-当前原型的 `/api/tasks` 不返回 Worker Token 或设置文件路径。Worker 尚未上报 FE 时，响应不伪造 `current_fe`、`max_fe` 或 ETA；前端显示“等待 FE 上报”。后续任务心跳接口会补充这些字段并以 WebSocket 推送。
+调度单位为 Task：一个算法、一个问题实例和多个 seed。每次领取产生一个 Attempt 与不可转发的 `lease_token`。任何写入都必须同时匹配 `task_id + attempt_id + lease_token`，过期或已回收的租约返回 `410`。
 
-## Worker 领取任务
+## Worker 调用 Master
 
-Worker 请求：
-
-```json
-{
-  "free_slots": 2,
-  "running_attempt_ids": ["..."],
-  "platemo_commit": "b8687ee"
-}
-```
-
-Master 返回 `204` 表示无任务，返回 `200` 表示授予租约：
-
-```json
-{
-  "task_id": "uuid",
-  "attempt_id": "uuid",
-  "lease_token": "opaque-secret",
-  "lease_expires_at": "2026-08-13T03:00:00Z",
-  "algorithm": {"name": "VRLFSEA", "parameters": {"sigma": 5}},
-  "problem": {"name": "SMOP1", "parameters": {"M": 2, "D": 100, "theta": 0.1}},
-  "seed": 17,
-  "max_fe": 50000,
-  "retain_points": 100,
-  "settings_artifact": {"url": "...", "sha256": "..."}
-}
-```
-
-## Progress 上报
-
-```json
-{
-  "lease_token": "opaque-secret",
-  "state": "running",
-  "pid": 38214,
-  "fe": 21500,
-  "total_fe": 50000,
-  "elapsed_seconds": 312.8,
-  "estimated_remaining_seconds": 413.2,
-  "phase": "environmental-selection",
-  "log_offset": 8119,
-  "reported_at": "2026-08-13T02:47:00Z"
-}
-```
-
-Master 拒绝过期租约、未知 Attempt 或 token 不匹配的进度。所有写操作以 `task_id + attempt_id + lease_token` 为幂等键。
-
-## WebSocket：Master 到前端
-
-路径：`/ws/v1/events`。事件至少包括：
-
-```json
-{"type":"worker.updated","worker_id":"uuid","status":"online","free_slots":2}
-{"type":"task.progress","task_id":"uuid","fe":21500,"total_fe":50000,"eta_seconds":413}
-{"type":"task.reclaimed","task_id":"uuid","old_worker_id":"uuid","reason":"three_missed_heartbeats"}
-{"type":"task.completed","task_id":"uuid","artifact_id":"uuid"}
-```
-
-前端断线重连后以最后事件 ID 拉取遗漏事件；事件仅用于视图刷新，数据库状态才是权威来源。
-
-## 错误与重试
-
-| HTTP | 语义 | Worker 行为 |
+| 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| 401/403 | 认证或租约无效 | 停止上报，重新注册或人工处理 |
-| 409 | 幂等冲突或状态冲突 | 拉取 Task 状态，不重复执行 |
-| 410 | 租约已过期 | 停止该 Attempt，保留本地产物 |
-| 422 | 任务参数不合法 | 标失败，不自动重试 |
-| 429/503 | Master 暂时不可用 | 指数退避，保持 MATLAB 不被重复启动 |
+| `POST` | `/api/v1/workers/register` | 以 Join Token 注册并领取 Node Token |
+| `POST` | `/api/v1/workers/{worker_id}/heartbeat` | 每 10 秒上报能力、空闲槽位、运行 Attempt；返回取消指令 |
+| `POST` | `/api/v1/workers/{worker_id}/lease` | 空闲 Worker 领取一个已分配 Task |
+| `POST` | `/api/v1/tasks/{task_id}/attempts/{attempt_id}/progress` | 上报批次和每个 seed 的 FE 进度 |
+| `POST` | `/api/v1/tasks/{task_id}/attempts/{attempt_id}/complete` | 确认 completed、failed 或 cancelled |
+| `PUT` | `/api/v1/artifacts/{artifact_id}` | 上载结果 MAT 或日志产物 |
+
+### 注册
+
+```json
+{
+  "worker_id": "uuid",
+  "name": "12600KF",
+  "url": "http://10.0.0.12:6001",
+  "capabilities": {"cpu_logical": 16, "gpu": [], "matlab_version": "R2024b"}
+}
+```
+
+注册响应：
+
+```json
+{"worker_id":"uuid","node_token":"opaque-secret","heartbeat_seconds":10}
+```
+
+### 租约
+
+`POST /lease` 请求体为 `{"free_slots": 1}`。无任务时响应 `{"task": null}`；有任务时返回：
+
+```json
+{
+  "task": {
+    "id": "uuid",
+    "algorithm": {"name": "VRLFSEA", "parameters": {"sigma": 5}},
+    "problem": {"name": "SMOP1", "parameters": {"M": 2, "D": 1000, "theta": 0.1}},
+    "seeds": [1, 2, 3],
+    "max_fe": 50000,
+    "retain_points": 100,
+    "cluster_profile": "local"
+  },
+  "attempt_id": "uuid",
+  "attempt_no": 1,
+  "lease_token": "opaque-secret"
+}
+```
+
+### 进度与完成
+
+```json
+{
+  "lease_token": "opaque-secret",
+  "phase": "running",
+  "completed_runs": 1,
+  "failed_runs": 0,
+  "running_runs": 2,
+  "total_runs": 3,
+  "pool": {"active": true, "workers": 8, "cluster_profile": "local"},
+  "runs": [
+    {"seed": 1, "state": "completed", "fe": 50000, "total_fe": 50000, "elapsed_seconds": 330, "error": ""},
+    {"seed": 2, "state": "running", "fe": 21500, "total_fe": 50000, "elapsed_seconds": 140, "error": ""}
+  ]
+}
+```
+
+完成请求包含以上最终 `runs`、`state`、`exit_code` 和可选 `error`。Worker 应先上传 `result.mat`，再发送完成确认。若进度或完成收到 `410`，Worker 停止该 Attempt 的后续上报并保留本地文件，不能继续执行或覆盖新租约。
+
+上传产物以 multipart/form-data 传递 `task_id`、`attempt_id`、`lease_token`、`kind` 和 `artifact`；Master 存储 SHA-256 与大小。
+
+## Master 提供给 UI
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| `GET` | `/api/catalog` | 算法、问题、参数、Setting 文件和已有数据 |
+| `PUT` | `/api/platemo-path` | 设置 PlatEMO 根目录 |
+| `GET` | `/api/workers` | Worker 列表，不泄露 Token |
+| `POST` | `/api/workers` | 手动录入已知节点 |
+| `POST` | `/api/workers/probe-all` | 探测所有 Worker 的可达性 |
+| `POST` | `/api/v1/experiments` | 创建正式实验 Task |
+| `GET` | `/api/v1/ui/tasks` | Seed 级状态、FE、耗时和 ETA 视图 |
+| `POST` | `/api/v1/tasks/{task_id}/cancel` | 取消排队任务或向运行 Worker 下发取消请求 |
+| `POST` | `/api/settings/load` | 导入 PlatEMO 或 Master 原生 MAT 设置 |
+| `POST` | `/api/settings/save` | 导出 Master 原生 MAT 设置 |
+
+实验创建请求携带算法和问题实例数组、运行次数、保留点数、可选最大 Worker 数以及选中的 Worker ID。Master 按 `priority` 从高到低选择节点，再轮转分配每个算法-问题批次。
+
+## WatchDog 和失败语义
+
+Worker 的标准心跳间隔为 10 秒。Master 仅将签名 heartbeat 视为续租；连续三次未收到，即超过 30 秒，Worker 标记 `suspect`，处于 `leased` 或 `running` 的 Task 回到 `queued`，原 Attempt 标记 `reclaimed`。旧 Attempt 之后的写入必定得到 `410`。
+
+| HTTP 状态 | Worker 行为 |
+| --- | --- |
+| `401` | 清除本地 Node Token，使用 Join Token 重新注册 |
+| `404` | 记录错误，保留本地产物并人工处理 |
+| `410` | 停止该 Attempt 上报和执行，保留本地文件 |
+| `422` | 标记任务失败，不自动重试相同输入 |
+| `429` / `503` | 指数退避重试通信，不能重复启动 MATLAB |

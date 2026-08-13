@@ -27,6 +27,9 @@
 - 接收 `result.mat`、日志、指标 CSV；校验 SHA-256 和大小后标记完成。
 - 支持后置指标计算任务，避免 Worker 端因指标失败而丢失最终 MAT。
 - 支持取消：Master 不再分配、向运行 Worker 发取消请求、保留中间日志。
+- 当前批次调度采用 Master 分配：Master 为每个算法-问题组合创建全局 `SeedRun` 队列，不将问题绑定某个 Worker。Worker 心跳仅上报批次槽位和并行池容量；Master 在心跳响应中以事务选择兼容的待运行 Seed，签发 `batch_attempt_id + lease_token`。运行中每个 Seed 的 FE、总 FE、耗时和错误写入 `seed_runs`，批次汇总写入 `batch_attempts`，MAT/日志写入 `artifacts`。
+- Worker 注册使用 `worker_join_token` 换取独立 `node_token`；Node Token 只用于该节点心跳、租约、进度、完成与产物请求，UI 接口永不返回 Token。
+- WatchDog 每 10 秒检查心跳；连续三次 10 秒周期无有效心跳时标记 Worker 为 `suspect`，只回收其批次内 `leased/running` 的未完成 Seed，已完成 Seed 保留，二者均记录审计事件。
 
 ## Vue 前端 UI
 
@@ -45,13 +48,13 @@
 
 工作台布局必须支持用户临时调整：前三列的右边界均可横向拖拽，第四列自动占据余下空间并允许较窄显示；左栏可在算法、问题、执行设置之间纵向拖拽。算法和问题区域仅有最小高度，不设置最大高度；执行设置按内容自然撑开，不允许裁切输入行。布局尺寸仅保存在当前浏览器会话；中栏顶部只保留“导入”和“保存”配置操作，不显示独立的“实验预设”选择行。
 
-任务运行卡按 `Worker | 问题 | 算法` 显示，第二行展示 Seed 与 `N/M/D`，右侧展示 `FE / maxFE` 进度条与 ETA。原型阶段当 Worker 尚未上报 FE 时，必须显示“等待 FE 上报 / ETA 等待上报”，不得伪造进度。Master 提供只读 `GET /api/tasks` 供前端轮询最近任务；后续 WebSocket 接入时保持该字段模型不变。已有数据项按“问题 | 算法”显示，文件命名中缺失 N 时展示 `N—`。
+任务运行卡按 `Worker | 问题 | 算法` 显示，第二行展示 Seed 与 `N/M/D`，右侧展示 `FE / maxFE` 进度条与 ETA。原型阶段当 Worker 尚未上报 FE 时，必须显示“等待 FE 上报 / ETA 等待上报”，不得伪造进度。Master 提供只读 `GET /api/v1/ui/tasks` 供前端轮询最近任务；后续 WebSocket 接入时保持该字段模型不变。已有数据项按“问题 | 算法”显示，文件命名中缺失 N 时展示 `N—`。
 
 成功通知（导入、保存、目录解析、创建任务）使用带进度条的浮层，约 4.6 秒后自动渐隐；错误通知保持可见，避免用户错过失败原因。
 
 ## 实时计算面板
 
-任务行至少展示：Worker、MATLAB PID、状态、当前 FE/总 FE、进度条、已运行时间、ETA、最后日志、最后上报时间、重试次数。
+任务行至少展示：Worker、MATLAB PID、状态、当前 FE/总 FE、进度条、已运行时间、ETA、最后日志、最后上报时间、重试次数。当前 Vue 工作台通过 `/api/v1/ui/tasks` 轮询 Seed 状态；协议稳定后可切换为 WebSocket，而不改变数据模型。
 
 计算规则：
 
@@ -71,3 +74,6 @@ ETA = (total_FE - FE) / rate
 - 回收后将 Task 置回 `queued`，`attempt_no + 1`，排除刚失联 Worker，按重试策略投递其它节点。
 - 达到 `max_attempts` 后置 `failed`，不无限重试。
 - 每次探测、回收、重新分配均记录审计事件并推送 UI 告警。
+## v1 调度实现
+
+Master 采用“Worker 主动连接、Master 主动决策”的模型：创建实验后为每个算法-问题实例创建全部 SeedRun，保存用户选中的可执行 Worker 集合。Worker 心跳报告 `available_batch_slots` 和 `max_seeds_per_batch`；Master 只在节点空闲时原子签发一个批次，并以优先级、当前占用和轮询决定下一批。10 秒一个签名心跳，连续三次缺失会回收该批次尚未完成的 Seed。接口细节和实现清单见 `Doc/07-seed-batch-scheduling.md`。

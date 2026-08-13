@@ -22,24 +22,24 @@ const retainPoints = ref(100)
 const showWorkerForm = ref(false)
 const showPlatemoForm = ref(false)
 const editingWorker = ref<string | null>(null)
-const workerForm = ref({ name: '', url: '', token: '' })
+const workerForm = ref({ name: '', url: '', token: '', priority: 0 })
 const busy = ref(false)
 const notice = ref<{ id: number; message: string } | null>(null)
 const error = ref('')
 const importedDiagnostics = ref<string[]>([])
 const uploadInput = ref<HTMLInputElement | null>(null)
 const workspace = ref<HTMLElement | null>(null)
-const columnWidths = ref({ catalog: 300, editor: 370, tasks: 360 })
-const catalogHeights = ref({ algorithms: 154, problems: 154 })
+const columnWidths = ref({ catalog: 330, editor: 370, existing: 330 })
+const catalogHeights = ref({ algorithms: 270, problems: 270 })
 let noticeId = 0
 let noticeTimer: ReturnType<typeof window.setTimeout> | undefined
 let taskRefreshTimer: ReturnType<typeof window.setInterval> | undefined
 
-type ColumnResizeTarget = 'catalog' | 'editor' | 'tasks'
+type ColumnResizeTarget = 'catalog' | 'editor' | 'existing'
 type CatalogResizeTarget = 'algorithms' | 'problems'
 
 type ResizeState =
-  | { direction: 'column'; target: ColumnResizeTarget; origin: number; widths: { catalog: number; editor: number; tasks: number } }
+  | { direction: 'column'; target: ColumnResizeTarget; origin: number; widths: { catalog: number; editor: number; existing: number } }
   | { direction: 'row'; target: CatalogResizeTarget; origin: number; heights: { algorithms: number; problems: number } }
 
 const resizeState = ref<ResizeState | null>(null)
@@ -47,7 +47,7 @@ const resizeState = ref<ResizeState | null>(null)
 const workspaceStyle = computed(() => ({
   '--catalog-width': `${columnWidths.value.catalog}px`,
   '--editor-width': `${columnWidths.value.editor}px`,
-  '--task-width': `${columnWidths.value.tasks}px`,
+  '--existing-width': `${columnWidths.value.existing}px`,
 }))
 
 const catalogStyle = computed(() => ({
@@ -96,16 +96,16 @@ function resize(event: PointerEvent) {
 
   if (state.direction === 'column') {
     const width = workspace.value?.clientWidth ?? 1000
-    const minimumExistingWidth = 250
+    const minimumTaskWidth = 480
     const handleWidth = 24
     const delta = event.clientX - state.origin
 
     if (state.target === 'catalog') {
-      columnWidths.value.catalog = clamp(state.widths.catalog + delta, 270, width - state.widths.editor - state.widths.tasks - minimumExistingWidth - handleWidth)
+      columnWidths.value.catalog = clamp(state.widths.catalog + delta, 300, width - state.widths.editor - state.widths.existing - minimumTaskWidth - handleWidth)
     } else if (state.target === 'editor') {
-      columnWidths.value.editor = clamp(state.widths.editor + delta, 330, width - state.widths.catalog - state.widths.tasks - minimumExistingWidth - handleWidth)
+      columnWidths.value.editor = clamp(state.widths.editor + delta, 330, width - state.widths.catalog - state.widths.existing - minimumTaskWidth - handleWidth)
     } else {
-      columnWidths.value.tasks = clamp(state.widths.tasks + delta, 300, width - state.widths.catalog - state.widths.editor - minimumExistingWidth - handleWidth)
+      columnWidths.value.existing = clamp(state.widths.existing + delta, 300, width - state.widths.catalog - state.widths.editor - minimumTaskWidth - handleWidth)
     }
     return
   }
@@ -287,13 +287,13 @@ async function saveNativeSetting() {
 }
 
 function openAddWorker() {
-  workerForm.value = { name: '', url: '', token: '' }
+  workerForm.value = { name: '', url: '', token: '', priority: 0 }
   editingWorker.value = null
   showWorkerForm.value = true
 }
 
 function openEditWorker(worker: Worker) {
-  workerForm.value = { name: worker.name, url: worker.url, token: '' }
+  workerForm.value = { name: worker.name, url: worker.url, token: '', priority: worker.priority ?? 0 }
   editingWorker.value = worker.id
   showWorkerForm.value = true
 }
@@ -324,7 +324,7 @@ async function deleteWorker(worker: Worker) {
   }
 }
 
-async function startMock() {
+async function startRun() {
   error.value = ''
   if (!selectedAlgorithms.value.length || !selectedProblems.value.length || !checkedWorkers.value.length) {
     error.value = '需要至少选择一个算法、一个问题实例和一个在线 Worker。'
@@ -332,7 +332,7 @@ async function startMock() {
   }
   busy.value = true
   try {
-    await api.startMock({
+    await api.startRun({
       algorithms: selectedAlgorithms.value,
       problems: selectedProblems.value,
       runs: runs.value,
@@ -341,9 +341,9 @@ async function startMock() {
       workerIds: checkedWorkers.value,
     })
     await loadTasks()
-    showNotice(`已创建 ${totalTasks.value} 个模拟任务。`)
+    showNotice(`已创建 ${totalTasks.value} 个任务。`)
   } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : '创建模拟任务失败'
+    error.value = caught instanceof Error ? caught.message : '创建任务失败'
   } finally {
     busy.value = false
   }
@@ -355,10 +355,45 @@ function taskParameter(task: TaskStatus, name: string) {
 }
 
 function taskStateLabel(task: TaskStatus) {
-  if (task.state === 'mock_queued') return '等待 Worker 领取'
   if (task.state === 'queued') return '已入队'
+  if (task.state === 'leased') return '已领取'
+  if (task.state === 'cancel_requested') return '正在取消'
   if (task.state === 'running') return '运行中'
   return task.state
+}
+
+function taskProgress(task: TaskStatus) {
+  const fe = Number(task.fe)
+  const total = Number(task.total_fe)
+  if (!Number.isFinite(fe) || !Number.isFinite(total) || total <= 0) return 0
+  return Math.round(Math.min(Math.max((fe / total) * 100, 0), 100))
+}
+
+function taskFeLabel(task: TaskStatus) {
+  const fe = Number(task.fe)
+  const total = Number(task.total_fe)
+  if (!Number.isFinite(fe) || !Number.isFinite(total) || total <= 0) return 'FE 等待上报'
+  return `FE ${fe.toLocaleString()} / ${total.toLocaleString()}`
+}
+
+function formatDuration(seconds: number | undefined) {
+  if (!Number.isFinite(seconds) || !seconds || seconds < 0) return '—'
+  const value = Math.floor(seconds)
+  const hours = Math.floor(value / 3600)
+  const minutes = Math.floor((value % 3600) / 60)
+  const remainingSeconds = value % 60
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`
+  if (minutes > 0) return `${minutes}m ${String(remainingSeconds).padStart(2, '0')}s`
+  return `${remainingSeconds}s`
+}
+
+function taskEtaLabel(task: TaskStatus) {
+  if (task.state === 'completed') return '已完成'
+  const fe = Number(task.fe)
+  const total = Number(task.total_fe)
+  const elapsed = Number(task.elapsed_seconds)
+  if (!Number.isFinite(fe) || !Number.isFinite(total) || !Number.isFinite(elapsed) || fe <= 0 || total <= fe || elapsed <= 0) return 'ETA 等待上报'
+  return `ETA ${formatDuration(((total - fe) / fe) * elapsed)}`
 }
 
 onMounted(() => {
@@ -444,18 +479,18 @@ onBeforeUnmount(() => {
     <div class="column-resizer" title="拖拽调整中间列宽度" @pointerdown="startColumnResize('editor', $event)"><span></span></div>
 
     <section class="task-panel">
-      <div class="plan-toolbar"><button class="primary-button" type="button" :disabled="busy" @click="startMock">启动模拟任务</button><button class="outline-button" type="button" :disabled="busy" @click="refreshAll"><RefreshCw :size="16" /> 刷新目录</button></div>
+      <div class="plan-toolbar"><button class="primary-button" type="button" :disabled="busy" @click="startRun">启动任务</button><button class="outline-button" type="button" :disabled="busy" @click="refreshAll"><RefreshCw :size="16" /> 刷新目录</button></div>
       <section class="plan-card"><h2>计划分配</h2><div class="metric-grid"><div><strong>{{ totalTasks }}</strong><span>总任务</span></div><div><strong>{{ selectedAlgorithms.length }}</strong><span>算法</span></div><div><strong>{{ selectedProblems.length }}</strong><span>问题</span></div><div><strong>{{ selectedWorkerCount }}</strong><span>节点</span></div></div><p class="plan-note">{{ selectedAlgorithms.length }} 个算法 × {{ selectedProblems.length }} 个问题实例 × {{ runs }} 次运行</p></section>
-      <section class="plan-card task-card"><h2>Seed 运行 <small>{{ activeTaskCount }} 个活动任务</small></h2><div class="task-list"><article v-for="task in taskStatuses" :key="task.id" class="task-row"><div class="task-title"><strong>{{ task.worker_name }}</strong><span>{{ task.problem }}</span><span>{{ task.algorithm }}</span></div><div class="task-meta">Seed {{ task.seed }} · N{{ taskParameter(task, 'N') }} · M{{ taskParameter(task, 'M') }} · D{{ taskParameter(task, 'D') }}</div><div class="task-progress"><span>{{ taskStateLabel(task) }}</span><b>FE — / —</b><div class="progress-track"><i></i></div><small>ETA 等待上报</small></div></article><p v-if="!taskStatuses.length" class="empty-text">启动任务后将在此显示每个 Seed 的分配和进度。</p></div></section>
+      <section class="plan-card task-card"><h2>Seed 运行 <small>{{ activeTaskCount }} 个活动任务</small></h2><div class="task-list"><article v-for="task in taskStatuses" :key="task.id" class="task-row"><div class="task-node"><span class="task-state-dot" :class="task.state"></span><strong>{{ task.worker_name }}</strong><span>{{ taskStateLabel(task) }}</span></div><div class="task-run"><div class="task-identifiers"><strong>{{ task.problem }}</strong><span>{{ task.algorithm }}</span></div><div class="progress-track" :aria-label="taskFeLabel(task)"><i :style="{ width: `${taskProgress(task)}%` }"></i></div><div class="task-metrics"><strong>{{ taskFeLabel(task) }}</strong><span>{{ taskProgress(task) }}%</span><small>运行 {{ formatDuration(task.elapsed_seconds) }}</small><small>{{ taskEtaLabel(task) }}</small></div></div><div class="task-meta">Seed {{ task.seed }} · N{{ taskParameter(task, 'N') }} · M{{ taskParameter(task, 'M') }} · D{{ taskParameter(task, 'D') }}</div></article><p v-if="!taskStatuses.length" class="empty-text">启动任务后将在此显示每个 Seed 的分配和进度。</p></div></section>
     </section>
-    <div class="column-resizer" title="拖拽调整运行状态列宽度" @pointerdown="startColumnResize('tasks', $event)"><span></span></div>
+    <div class="column-resizer" title="拖拽调整已有数据列宽度" @pointerdown="startColumnResize('existing', $event)"><span></span></div>
 
     <section class="existing-panel">
       <section class="plan-card existing-card"><h2>已有数据 <small>已选 {{ selectedExistingTestKeys.length }}</small></h2><div class="existing-list"><label v-for="test in existingTests" :key="existingTestKey(test)" class="existing-row" :class="{ selected: selectedExistingTestKeys.includes(existingTestKey(test)) }"><input v-model="selectedExistingTestKeys" :value="existingTestKey(test)" type="checkbox" /><span><span class="existing-title"><strong>{{ test.problem }}</strong><b>{{ test.algorithm }}</b></span><small>N— · M{{ test.M }} · D{{ test.D }}</small></span><button title="按此规模加入问题实例" class="icon-button" type="button" @click.prevent="addExistingTest(test)"><Plus :size="16" /></button></label><p v-if="!existingTests.length" class="empty-text">当前 Data 目录中没有可识别的结果文件。</p></div></section>
     </section>
   </main>
 
-  <div v-if="showWorkerForm" class="modal-backdrop" @click.self="showWorkerForm = false"><form class="worker-dialog" @submit.prevent="saveWorker"><div class="dialog-heading"><h2>{{ editingWorker ? '编辑 Worker' : '添加 Worker' }}</h2><button title="关闭" class="icon-button" type="button" @click="showWorkerForm = false"><X :size="18" /></button></div><label>名称<input v-model.trim="workerForm.name" required /></label><label>地址<input v-model.trim="workerForm.url" required placeholder="http://zerotier-ip:6001" /></label><label>Token<input v-model="workerForm.token" type="password" :placeholder="editingWorker ? '留空则不修改' : '可选'" /></label><div class="dialog-actions"><button class="outline-button" type="button" @click="showWorkerForm = false">取消</button><button class="primary-button" :disabled="busy" type="submit">保存</button></div></form></div>
+  <div v-if="showWorkerForm" class="modal-backdrop" @click.self="showWorkerForm = false"><form class="worker-dialog" @submit.prevent="saveWorker"><div class="dialog-heading"><h2>{{ editingWorker ? '编辑 Worker' : '手动添加 Worker' }}</h2><button title="关闭" class="icon-button" type="button" @click="showWorkerForm = false"><X :size="18" /></button></div><label>名称<input v-model.trim="workerForm.name" required /></label><label>地址<input v-model.trim="workerForm.url" required placeholder="http://zerotier-ip:6001" /></label><label>Node Token<input v-model="workerForm.token" type="password" :placeholder="editingWorker ? '留空则不修改' : '注册后从 Worker 配置复制'" /></label><label>优先级<input v-model.number="workerForm.priority" type="number" min="0" /></label><p class="dialog-note">推荐直接在 Worker 配置 Master Join Token，让 Worker 自动注册；手动添加仅用于已取得 Node Token 的节点。</p><div class="dialog-actions"><button class="outline-button" type="button" @click="showWorkerForm = false">取消</button><button class="primary-button" :disabled="busy" type="submit">保存</button></div></form></div>
   <div v-if="showPlatemoForm" class="modal-backdrop" @click.self="showPlatemoForm = false"><form class="worker-dialog" @submit.prevent="savePlatemoPath"><div class="dialog-heading"><h2>PlatEMO 路径</h2><button title="关闭" class="icon-button" type="button" @click="showPlatemoForm = false"><X :size="18" /></button></div><label>根目录<input v-model.trim="platemoPath" required placeholder="例如：H:\PlatEMO" /></label><p class="dialog-note">目录必须包含 Algorithms、Problems 和 Data。</p><div class="dialog-actions"><button class="outline-button" type="button" @click="showPlatemoForm = false">取消</button><button class="primary-button" :disabled="busy" type="submit">保存并解析</button></div></form></div>
   <Transition name="toast"><div v-if="notice" :key="notice.id" class="toast notice-toast"><span>{{ notice.message }}</span><i class="toast-progress"></i></div></Transition><div v-if="error" class="toast error-toast">{{ error }}</div>
 </template>
