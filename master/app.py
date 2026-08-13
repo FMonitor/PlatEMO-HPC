@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
@@ -64,26 +64,39 @@ def create_app(data_dir: Path) -> FastAPI:
     app.state.store = store
 
     @app.get("/", response_class=HTMLResponse)
-    async def index(request: Request) -> HTMLResponse:
+    async def index(request: Request, message: str = "") -> HTMLResponse:
+        workers = store.workers()
+        async with httpx.AsyncClient(timeout=3) as client:
+            for worker in workers:
+                headers = {"X-Worker-Token": worker["token"]} if worker["token"] else {}
+                try:
+                    response = await client.get(f"{worker['url']}/api/health", headers=headers)
+                    response.raise_for_status()
+                    health = response.json()
+                    worker.update({"online": True, "queue_count": health.get("queued", 0),
+                                   "last_check": now(), "health_error": ""})
+                except httpx.HTTPError as exc:
+                    worker.update({"online": False, "queue_count": "-", "last_check": now(),
+                                   "health_error": str(exc)})
         return templates.TemplateResponse(request, "index.html", {
-            "workers": store.workers(), "tasks": store.tasks(), "data_dir": str(data_dir),
+            "workers": workers, "tasks": store.tasks(), "data_dir": str(data_dir), "message": message,
         })
 
     @app.get("/api/workers")
     async def list_workers() -> list[dict[str, Any]]:
-        return store.workers()
+        return [{key: value for key, value in worker.items() if key != "token"} for worker in store.workers()]
 
     @app.post("/api/workers")
-    async def add_worker(name: str = Form(...), url: str = Form(...), token: str = Form("")) -> dict[str, str]:
+    async def add_worker(request: Request, name: str = Form(...), url: str = Form(...), token: str = Form("")) -> RedirectResponse:
         worker_id = str(uuid.uuid4())
         with store.connect() as con:
             con.execute("INSERT INTO workers VALUES (?, ?, ?, ?, ?)",
                         (worker_id, name, url.rstrip("/"), token, now()))
-        return {"id": worker_id}
+        return RedirectResponse(url=f"/?message=Worker+added%3A+{worker_id}", status_code=303)
 
     @app.post("/api/tasks")
     async def create_task(worker_id: str = Form(...), algorithm: str = Form(...), problem: str = Form(...),
-                          seeds: str = Form("1"), pool_size: int = Form(1), settings: UploadFile | None = File(None)) -> dict[str, Any]:
+                          seeds: str = Form("1"), pool_size: int = Form(1), settings: UploadFile | None = File(None)) -> RedirectResponse:
         try:
             seed_list = [int(value.strip()) for value in seeds.split(",") if value.strip()]
         except ValueError as exc:
@@ -115,7 +128,7 @@ def create_app(data_dir: Path) -> FastAPI:
             raise HTTPException(502, f"Worker did not accept task: {exc}") from exc
         with store.connect() as con:
             con.execute("UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?", ("queued", now(), task_id))
-        return payload
+        return RedirectResponse(url=f"/?message=Task+queued%3A+{task_id}", status_code=303)
 
     @app.post("/api/results/{task_id}")
     async def receive_result(task_id: str, result: UploadFile = File(...), state: str = Form("completed"), error: str = Form("")) -> dict[str, str]:
