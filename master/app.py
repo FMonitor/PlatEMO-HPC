@@ -209,7 +209,7 @@ def create_app(data_dir: Path) -> FastAPI:
         algorithms_json: str = Form(...),
         problems_json: str = Form(...),
         runs: int = Form(30),
-        pool_size: int = Form(1),
+        max_workers: int | None = Form(None),
         retain_points: int = Form(100),
         worker_ids: list[str] = Form(...),
     ) -> RedirectResponse:
@@ -221,10 +221,12 @@ def create_app(data_dir: Path) -> FastAPI:
             raise HTTPException(400, "Invalid experiment list") from exc
         if not algorithms or not problems:
             raise HTTPException(400, "Select at least one algorithm and one problem")
-        if not 1 <= runs <= 1000 or retain_points < 1:
+        if not 1 <= runs <= 1000 or retain_points < 1 or (max_workers is not None and max_workers < 1):
             raise HTTPException(400, "Runs must be between 1 and 1000")
         selected = [worker for worker in store.workers() if worker["id"] in set(worker_ids)]
         online = [worker for worker in selected if worker["online"]]
+        if max_workers is not None:
+            online = online[:max_workers]
         if not online:
             raise HTTPException(400, "Select at least one online Worker")
         run_id = str(uuid.uuid4())
@@ -235,7 +237,7 @@ def create_app(data_dir: Path) -> FastAPI:
                 task_id = str(uuid.uuid4())
                 payload = {
                     "id": task_id, "run_id": run_id, "mock": True, "algorithm": algorithm,
-                    "problem": problem, "seed": seed, "pool_size": pool_size,
+                    "problem": problem, "seed": seed, "max_workers": max_workers,
                     "retain_points": retain_points, "created_at": now(),
                 }
                 con.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, '')",
