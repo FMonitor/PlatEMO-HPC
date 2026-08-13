@@ -115,15 +115,20 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
             if not match or match.group(1) != path.stem or match.group(2).split(".")[-1].lower() != base_type.lower():
                 continue
             parameters = []
-            if base_type.lower() == "algorithm":
-                call = next(iter(parameter_re.findall(source)), "")
-                pieces = [piece.strip() for piece in call.replace("...", "").split(",")]
-                for index in range(0, len(pieces) - 1, 3):
-                    name = pieces[index].strip("'\"")
-                    if re.fullmatch(r"[A-Za-z_]\w*", name):
-                        parameters.append({"name": name, "default": pieces[index + 1]})
+            call = next(iter(parameter_re.findall(source)), "")
+            pieces = [piece.strip() for piece in call.replace("...", "").split(",")]
+            for index in range(0, len(pieces) - 1, 3):
+                name = pieces[index].strip("'\"")
+                if re.fullmatch(r"[A-Za-z_]\w*", name):
+                    parameters.append({"name": name, "default": pieces[index + 1]})
             result.append({"name": path.stem, "parameters": parameters})
         return sorted(result, key=lambda item: item["name"].lower())
+
+    def settings_catalog() -> list[dict[str, str]]:
+        root = Path(store.setting("platemo_path")) / "Data"
+        if not root.is_dir():
+            return []
+        return [{"name": path.stem, "path": str(path)} for path in sorted(root.glob("Settings*.mat"))]
 
     async def probe_worker(worker: dict[str, Any]) -> dict[str, Any]:
         headers = {"X-Worker-Token": worker["token"]} if worker["token"] else {}
@@ -162,6 +167,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
             "workers": store.workers(), "tasks": store.tasks(), "data_dir": str(data_dir), "message": message,
             "platemo_path": store.setting("platemo_path"),
             "algorithms": catalog("Algorithms", "Algorithm"), "problems": catalog("Problems", "PROBLEM"),
+            "settings": settings_catalog(),
         })
 
     @app.post("/api/settings/platemo-path")
@@ -270,6 +276,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
         runs: int = Form(30),
         max_workers: int | None = Form(None),
         retain_points: int = Form(100),
+        settings_file: str = Form(""),
         worker_ids: list[str] = Form(...),
     ) -> RedirectResponse:
         """Create local placeholder tasks to validate the assignment policy without MATLAB."""
@@ -297,7 +304,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
                 payload = {
                     "id": task_id, "run_id": run_id, "mock": True, "algorithm": algorithm,
                     "problem": problem, "seed": seed, "max_workers": max_workers,
-                    "retain_points": retain_points, "created_at": now(),
+                    "retain_points": retain_points, "settings_file": settings_file, "created_at": now(),
                 }
                 con.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, '')",
                             (task_id, worker["id"], "mock_queued", json.dumps(payload), now(), now()))
