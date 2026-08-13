@@ -10,6 +10,7 @@
 | [02-master.md](02-master.md) | Master 后端、Vue 管理面板、PlatEMO 设置和 WatchDog 需求 |
 | [03-worker.md](03-worker.md) | Worker 执行器、MATLAB 包装器、进度与恢复需求 |
 | [04-api-protocol.md](04-api-protocol.md) | REST/WebSocket 通信协议、认证、幂等和错误语义 |
+| [07-seed-batch-scheduling.md](07-seed-batch-scheduling.md) | 多 Worker 分担同一实验点的 Master 分配方案、实现边界和验收条件 |
 
 ## 目标与非目标
 
@@ -37,7 +38,7 @@
 
 ## 优先实现顺序
 
-1. 规范化数据库、Worker 注册、任务租约和幂等 API。
+1. 规范化数据库、Worker 注册、Master Seed 批次分配和幂等 API。
 2. Worker 执行 MATLAB 包装器，上报 FE、总 FE、ETA、日志和最终 MAT。
 3. Vue 管理面板与 WebSocket 实时状态。
 4. WatchDog、重试、优先级和审计界面。

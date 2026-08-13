@@ -20,13 +20,15 @@ flowchart LR
 
 ## 任务层级
 
-`Experiment` 是用户在界面保存或启动的一次实验配置；`Task` 是可独立调度的最小工作单元；`Attempt` 是该 Task 在一个 Worker 上的一次执行记录。
+`Experiment` 是用户在界面保存或启动的一次实验配置；`ExperimentPoint` 是一个算法实例加一个问题实例；`SeedRun` 是可独立调度和回收的最小工作单元；`BatchAttempt` 是 Master 分给一个 Worker 的一组同属一个 ExperimentPoint 的 SeedRun。
 
 ```text
 Experiment
-  ├─ 算法实例 A + 问题实例 P + seed 1 -> Task 1
-  ├─ 算法实例 A + 问题实例 P + seed 2 -> Task 2
-  └─ 算法实例 B + 问题实例 P + seed 1 -> Task 3
+  ├─ ExperimentPoint: 算法实例 A + 问题实例 P
+  │  ├─ SeedRun 1 ... SeedRun 30（由 Master 全局管理）
+  │  ├─ BatchAttempt A: Worker 1, Seed 1..10
+  │  └─ BatchAttempt B: Worker 2, Seed 11..18
+  └─ ExperimentPoint: 算法实例 B + 问题实例 P
 
 任务数 = 算法实例数 × 问题实例数 × 每测试点运行次数
 ```
@@ -52,29 +54,28 @@ Master 原生导出的 MAT 采用 `PlatEMO_HPC_SettingsJSON`，用于再次导�
 | `experiment` | 名称、Settings MAT、算法实例、问题实例、运行次数、最大 Worker 数、保留数据点数、创建人 |
 | `algorithm_instance` | 算法类名、参数 JSON、排序号 |
 | `problem_instance` | 问题类名、M/D/自定义参数 JSON、排序号 |
-| `task` | 实验 ID、实例 ID、seed、优先级、状态、当前 attempt、结果路径、租约到期时间 |
-| `attempt` | Task ID、Worker ID、开始/结束、FE、总 FE、ETA、PID、错误、日志路径 |
-| `artifact` | Task ID、类型、文件名、哈希、大小、存储路径 |
+| `experiment_point` | 实验 ID、算法实例、问题实例、参数快照、允许 Worker 集合、状态 |
+| `seed_run` | ExperimentPoint ID、seed、状态、当前 BatchAttempt、FE、总 FE、结果路径、租约到期时间 |
+| `batch_attempt` | ExperimentPoint ID、Worker ID、Seed 集合、开始/结束、lease token、MATLAB PID、pool 状态、错误、日志路径 |
+| `artifact` | ExperimentPoint ID、Seed、BatchAttempt ID、类型、文件名、哈希、大小、存储路径 |
 | `event` | 时间、事件类型、实体、JSON 负载，用于 UI 和审计 |
 
 ## 状态机
 
 ```mermaid
 stateDiagram-v2
-  [*] --> queued
-  queued --> leased: Worker 领取并获得租约
-  leased --> running: MATLAB PID 已启动
-  running --> uploading: 结果开始上传
-  uploading --> completed: MAT 与校验均成功
-  leased --> queued: 租约过期
-  running --> queued: WatchDog 回收且可重试
-  running --> failed: 不可重试错误或重试耗尽
-  queued --> cancelled: 用户取消
-  leased --> cancelled: 用户取消
-  running --> cancelled: Worker 接受取消
+  [*] --> pending
+  pending --> leased: Master 分配到 BatchAttempt
+  leased --> running: Worker 已启动 MATLAB
+  running --> completed: 单个 Seed 写入并确认结果
+  leased --> pending: 批次租约过期
+  running --> pending: WatchDog 回收未完成 Seed
+  pending --> cancelled: 用户取消实验点
+  leased --> cancelled: 用户取消实验点
+  running --> cancelled: Worker 停止整个批次
 ```
 
-状态迁移必须写事务日志。Task 重试不覆盖旧 Attempt；每次重试创建新 Attempt。
+状态迁移必须写事务日志。Seed 重试不覆盖旧 BatchAttempt；每次重新分配创建新 BatchAttempt。
 
 ## 调度策略
 
@@ -88,4 +89,4 @@ stateDiagram-v2
 4. 近五分钟失败率，低者优先。
 5. 同分时轮询，避免长期偏置。
 
-`max_workers` 约束一次 Experiment 同时可使用的不同 Worker 数；它不是 MATLAB 本地 `parpool` 大小。Worker 自己根据其 `max_local_slots` 和任务内 seed 批次决定本地并发。
+`max_workers` 约束一次 Experiment 同时可使用的不同 Worker 数；它不是 MATLAB 本地 `parpool` 大小。Master 依据 Worker 上报的 `max_seeds_per_batch` 签发 Seed 批次；Worker 在批内以本机 `parpool` 执行。

@@ -86,6 +86,36 @@ class Store:
                     id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, task_id TEXT, attempt_id TEXT,
                     payload TEXT NOT NULL, created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS experiments (
+                    id TEXT PRIMARY KEY, state TEXT NOT NULL, config_json TEXT NOT NULL,
+                    max_workers INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS experiment_points (
+                    id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+                    algorithm_json TEXT NOT NULL, problem_json TEXT NOT NULL,
+                    allowed_workers_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS seed_runs_v2 (
+                    experiment_point_id TEXT NOT NULL, seed INTEGER NOT NULL,
+                    state TEXT NOT NULL, batch_attempt_id TEXT, fe INTEGER NOT NULL DEFAULT 0,
+                    total_fe INTEGER NOT NULL DEFAULT 0, elapsed_seconds REAL NOT NULL DEFAULT 0,
+                    result_path TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL,
+                    PRIMARY KEY (experiment_point_id, seed)
+                );
+                CREATE TABLE IF NOT EXISTS batch_attempts (
+                    id TEXT PRIMARY KEY, experiment_point_id TEXT NOT NULL, worker_id TEXT NOT NULL,
+                    lease_token TEXT NOT NULL, state TEXT NOT NULL, seed_json TEXT NOT NULL,
+                    assigned_at TEXT NOT NULL, accepted_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT '', lease_deadline TEXT NOT NULL,
+                    pid INTEGER, pool_json TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS artifacts_v2 (
+                    id TEXT PRIMARY KEY, experiment_point_id TEXT NOT NULL, batch_attempt_id TEXT NOT NULL,
+                    seed INTEGER, kind TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL,
+                    size INTEGER NOT NULL, created_at TEXT NOT NULL
+                );
             """)
             if platemo_path is not None:
                 con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('platemo_path', ?)",
@@ -193,6 +223,25 @@ class Store:
         with self.connect() as con:
             con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
+    def record_v2_event(self, event_type: str, point_id: str | None, batch_id: str | None, payload: dict[str, Any]) -> None:
+        self.event(event_type, point_id, batch_id, payload)
+
+    def recover_batch(self, batch_id: str, reason: str, cancelled: bool = False) -> None:
+        """Invalidate a batch and only release SeedRuns that are not terminal."""
+        terminal = ("completed", "failed", "cancelled")
+        with self.connect() as con:
+            batch = con.execute("SELECT * FROM batch_attempts WHERE id=?", (batch_id,)).fetchone()
+            if batch is None or batch["state"] in {"completed", "failed", "cancelled", "reclaimed", "rejected"}:
+                return
+            state = "cancelled" if cancelled else "reclaimed"
+            con.execute("UPDATE batch_attempts SET state=?, finished_at=?, error=? WHERE id=?", (state, now(), reason, batch_id))
+            rows = con.execute("SELECT seed, state FROM seed_runs_v2 WHERE batch_attempt_id=?", (batch_id,)).fetchall()
+            for row in rows:
+                if row["state"] not in terminal:
+                    con.execute("UPDATE seed_runs_v2 SET state=?, batch_attempt_id=NULL, error=?, updated_at=? WHERE batch_attempt_id=? AND seed=?",
+                                ("cancelled" if cancelled else "pending", reason, now(), batch_id, row["seed"]))
+            con.execute("UPDATE experiment_points SET updated_at=? WHERE id=?", (now(), batch["experiment_point_id"]))
+
 
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -248,7 +297,6 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
     async def watchdog_forever() -> None:
         while True:
             cutoff = datetime.now(timezone.utc) - timedelta(seconds=30)
-            reclaimed: list[tuple[str, str, str, list[int]]] = []
             with store.connect() as con:
                 rows = con.execute("SELECT id, last_heartbeat FROM workers WHERE status = 'online'").fetchall()
                 for worker in rows:
@@ -258,25 +306,15 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                         heartbeat = datetime.min.replace(tzinfo=timezone.utc)
                     if heartbeat < cutoff:
                         con.execute("UPDATE workers SET online=0, status='suspect' WHERE id=?", (worker["id"],))
-                        stale_tasks = con.execute("SELECT id, payload FROM tasks WHERE worker_id=? AND state IN ('leased','running')", (worker["id"],)).fetchall()
-                        for task in stale_tasks:
-                            replacement = con.execute(
-                                "SELECT id FROM workers WHERE id<>? AND status='online' AND last_heartbeat>=? "
-                                "ORDER BY priority DESC, created_at LIMIT 1",
-                                (worker["id"], cutoff.isoformat()),
-                            ).fetchone()
-                            replacement_id = replacement["id"] if replacement else worker["id"]
-                            con.execute("UPDATE tasks SET worker_id=?, state='queued', updated_at=?, error=? WHERE id=?",
-                                        (replacement_id, now(), "worker heartbeat timeout; requeued", task["id"]))
-                            con.execute("UPDATE attempts SET state='reclaimed', finished_at=?, error=? WHERE task_id=? AND state IN ('leased','running')", (now(), "three missed heartbeats", task["id"]))
-                            try:
-                                seeds = [int(seed) for seed in json.loads(task["payload"]).get("seeds", [])]
-                            except (TypeError, ValueError, json.JSONDecodeError):
-                                seeds = []
-                            reclaimed.append((task["id"], worker["id"], replacement_id, seeds))
-            for task_id, worker_id, replacement_id, seeds in reclaimed:
-                attempt_id, _ = store.create_attempt(task_id, seeds)
-                store.event("task.reclaimed", task_id, attempt_id, {"worker_id": worker_id, "replacement_worker_id": replacement_id, "reason": "three_missed_heartbeats"})
+            with store.connect() as con:
+                expired = con.execute(
+                    "SELECT id, worker_id FROM batch_attempts WHERE state IN ('assigned','accepted','running') "
+                    "AND (lease_deadline<? OR worker_id IN (SELECT id FROM workers WHERE status='suspect'))",
+                    (now(),),
+                ).fetchall()
+            for batch in expired:
+                store.recover_batch(batch["id"], "heartbeat or lease timeout")
+                store.record_v2_event("batch.reclaimed", None, batch["id"], {"worker_id": batch["worker_id"], "reason": "three_missed_heartbeats"})
             await asyncio.sleep(10)
 
     @app.on_event("startup")
@@ -388,31 +426,28 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
 
     @app.get("/api/v1/ui/tasks")
     async def list_tasks() -> list[dict[str, Any]]:
-        """Return recent seed-level task state for the run-status panel without secrets."""
+        """Return the v2 global SeedRun view used by the Vue task cards."""
         worker_names = {worker["id"]: worker["name"] for worker in store.workers()}
         result: list[dict[str, Any]] = []
-        for task in store.tasks():
-            try:
-                payload = json.loads(task["payload"])
-            except json.JSONDecodeError:
-                payload = {}
-            with store.connect() as con:
-                attempt = con.execute("SELECT * FROM attempts WHERE task_id = ? ORDER BY attempt_no DESC LIMIT 1", (task["id"],)).fetchone()
-                seed_rows = con.execute("SELECT * FROM seed_runs WHERE task_id = ? AND attempt_id = ? ORDER BY seed", (task["id"], attempt["attempt_id"])).fetchall() if attempt else []
-            parameters = dict(payload.get("problem", {}).get("parameters", {})) if isinstance(payload.get("problem"), dict) else {}
-            for name in ("N", "M", "D"):
-                if name in payload:
-                    parameters[name] = payload[name]
-            seeds = seed_rows or [{"seed": seed, "state": task["state"], "fe": 0, "total_fe": payload.get("max_fe", 0), "elapsed_seconds": 0, "error": task["error"]} for seed in payload.get("seeds", [])]
-            for seed in seeds:
-                result.append({
-                    "id": f"{task['id']}:{seed['seed']}", "task_id": task["id"], "attempt_id": attempt["attempt_id"] if attempt else "",
-                    "state": seed["state"], "worker_id": task["worker_id"], "worker_name": worker_names.get(task["worker_id"], "未分配"),
-                    "algorithm": payload.get("algorithm", {}).get("name", "") if isinstance(payload.get("algorithm"), dict) else "",
-                    "problem": payload.get("problem", {}).get("name", "") if isinstance(payload.get("problem"), dict) else "",
-                    "seed": seed["seed"], "parameters": parameters, "fe": seed["fe"], "total_fe": seed["total_fe"],
-                    "elapsed_seconds": seed["elapsed_seconds"], "created_at": task["created_at"], "updated_at": task["updated_at"], "error": seed["error"],
-                })
+        with store.connect() as con:
+            rows = con.execute(
+                "SELECT s.*, p.algorithm_json, p.problem_json, p.created_at, b.worker_id "
+                "FROM seed_runs_v2 s JOIN experiment_points p ON p.id=s.experiment_point_id "
+                "LEFT JOIN batch_attempts b ON b.id=s.batch_attempt_id "
+                "ORDER BY p.created_at DESC, s.seed LIMIT 500"
+            ).fetchall()
+        for seed in rows:
+            algorithm = json.loads(seed["algorithm_json"])
+            problem = json.loads(seed["problem_json"])
+            parameters = dict(problem.get("parameters", {}))
+            result.append({
+                "id": f"{seed['experiment_point_id']}:{seed['seed']}", "task_id": seed["experiment_point_id"],
+                "attempt_id": seed["batch_attempt_id"] or "", "batch_attempt_id": seed["batch_attempt_id"] or "",
+                "state": seed["state"], "worker_id": seed["worker_id"], "worker_name": worker_names.get(seed["worker_id"], "未分配"),
+                "algorithm": algorithm.get("name", ""), "problem": problem.get("name", ""), "seed": seed["seed"],
+                "parameters": parameters, "fe": seed["fe"], "total_fe": seed["total_fe"],
+                "elapsed_seconds": seed["elapsed_seconds"], "created_at": seed["created_at"], "updated_at": seed["updated_at"], "error": seed["error"],
+            })
         return result
 
     @app.post("/api/workers")
@@ -487,83 +522,143 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
         store.event("worker.registered", None, None, {"worker_id": worker_id, "name": payload.get("name", worker_id)})
         return {"worker_id": worker_id, "node_token": node_token, "heartbeat_seconds": 10}
 
+    def assign_batch(worker_id: str, capacity: dict[str, Any]) -> dict[str, Any] | None:
+        """Atomically choose pending seeds and issue one BatchAttempt for a heartbeat."""
+        batch_size = max(1, min(int(capacity.get("max_seeds_per_batch", 1)), 10_000))
+        with store.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            worker = con.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
+            active_points = con.execute(
+                "SELECT DISTINCT p.id FROM experiment_points p JOIN batch_attempts b ON b.experiment_point_id=p.id "
+                "WHERE b.worker_id=? AND b.state IN ('assigned','accepted','running')", (worker_id,)
+            ).fetchall()
+            if worker is None or int(capacity.get("available_batch_slots", 0)) < 1:
+                return None
+            points = con.execute("SELECT * FROM experiment_points WHERE state='pending' ORDER BY created_at, ordinal").fetchall()
+            for point in points:
+                allowed = json.loads(point["allowed_workers_json"])
+                if worker_id not in allowed:
+                    continue
+                experiment = con.execute("SELECT max_workers FROM experiments WHERE id=? AND state='running'", (point["experiment_id"],)).fetchone()
+                if experiment is None:
+                    continue
+                used = con.execute(
+                    "SELECT COUNT(DISTINCT b.worker_id) FROM batch_attempts b "
+                    "JOIN experiment_points p2 ON p2.id=b.experiment_point_id "
+                    "WHERE p2.experiment_id=? AND b.state IN ('assigned','accepted','running')",
+                    (point["experiment_id"],),
+                ).fetchone()[0]
+                worker_already_used = con.execute(
+                    "SELECT 1 FROM batch_attempts b JOIN experiment_points p2 ON p2.id=b.experiment_point_id "
+                    "WHERE p2.experiment_id=? AND b.worker_id=? AND b.state IN ('assigned','accepted','running') LIMIT 1",
+                    (point["experiment_id"], worker_id),
+                ).fetchone()
+                if experiment["max_workers"] is not None and used >= experiment["max_workers"] and worker_already_used is None:
+                    continue
+                seeds = con.execute("SELECT seed FROM seed_runs_v2 WHERE experiment_point_id=? AND state='pending' ORDER BY seed LIMIT ?", (point["id"], batch_size)).fetchall()
+                if not seeds:
+                    continue
+                batch_id, token = str(uuid.uuid4()), str(uuid.uuid4())
+                seed_values = [row["seed"] for row in seeds]
+                deadline = (datetime.now(timezone.utc) + timedelta(seconds=10)).isoformat()
+                con.execute("INSERT INTO batch_attempts (id, experiment_point_id, worker_id, lease_token, state, seed_json, assigned_at, lease_deadline) VALUES (?, ?, ?, ?, 'assigned', ?, ?, ?)",
+                            (batch_id, point["id"], worker_id, token, json.dumps(seed_values), now(), deadline))
+                con.executemany("UPDATE seed_runs_v2 SET state='leased', batch_attempt_id=?, attempts=attempts+1, updated_at=? WHERE experiment_point_id=? AND seed=? AND state='pending'",
+                                [(batch_id, now(), point["id"], seed) for seed in seed_values])
+                experiment_config = json.loads(con.execute("SELECT config_json FROM experiments WHERE id=?", (point["experiment_id"],)).fetchone()[0])
+                con.execute("COMMIT")
+                algorithm, problem = json.loads(point["algorithm_json"]), json.loads(point["problem_json"])
+                params = problem.get("parameters", {})
+                store.record_v2_event("seed.assigned", point["id"], batch_id, {"worker_id": worker_id, "seeds": seed_values})
+                return {"batch_attempt_id": batch_id, "lease_token": token, "experiment_point_id": point["id"],
+                        "algorithm": algorithm, "problem": problem, "seeds": seed_values,
+                        "max_fe": int(params.get("maxFE", params.get("max_fe", 50000)) or 50000),
+                        "retain_points": int(experiment_config.get("retain_points", 100)),
+                        "cluster_profile": "local"}
+            con.execute("COMMIT")
+        return None
+
     @app.post("/api/v1/workers/{worker_id}/heartbeat")
     async def worker_heartbeat(worker_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, Any]:
-        worker = require_node(worker_id, authorization)
+        require_node(worker_id, authorization)
+        capacity = {key: payload.get(key, 0) for key in ("available_batch_slots", "max_concurrent_batches", "configured_pool_workers", "max_seeds_per_batch")}
         with store.connect() as con:
             con.execute("UPDATE workers SET online=1, status='online', last_heartbeat=?, last_check=?, queue_count=?, capabilities_json=? WHERE id=?",
-                        (now(), now(), int(payload.get("free_slots", 0)), json.dumps(payload.get("capabilities", {})), worker_id))
-        for item in payload.get("running", []):
-            if isinstance(item, dict) and item.get("task_id") and item.get("attempt_id") and item.get("progress"):
-                attempt = store.attempt(item["task_id"], item["attempt_id"], item.get("lease_token", ""))
-                if attempt:
-                    store.apply_progress(item["task_id"], item["attempt_id"], item["progress"])
-        with store.connect() as con:
-            cancelled = con.execute(
-                "SELECT id FROM tasks WHERE worker_id=? AND state='cancel_requested'", (worker_id,)
-            ).fetchall()
-        return {"status": "ok", "server_time": now(), "cancel_task_ids": [row["id"] for row in cancelled]}
+                        (now(), now(), int(capacity["available_batch_slots"]), json.dumps(payload.get("capabilities", {})), worker_id))
+            cancelled = con.execute("SELECT id FROM batch_attempts WHERE worker_id=? AND state='cancel_requested'", (worker_id,)).fetchall()
+        assignment = assign_batch(worker_id, capacity)
+        return {"status": "ok", "server_time": now(), "cancel_batch_attempt_ids": [row["id"] for row in cancelled], "assignment": assignment}
 
-    @app.post("/api/v1/workers/{worker_id}/lease")
-    async def worker_lease(worker_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, Any]:
-        require_node(worker_id, authorization)
+    def valid_batch(batch_id: str, token: str, authorization: str | None) -> sqlite3.Row:
         with store.connect() as con:
-            row = con.execute("SELECT * FROM tasks WHERE worker_id=? AND state='queued' ORDER BY created_at LIMIT 1", (worker_id,)).fetchone()
-            if row is None:
-                return {"task": None}
-            attempt = con.execute("SELECT * FROM attempts WHERE task_id=? ORDER BY attempt_no DESC LIMIT 1", (row["id"],)).fetchone()
-            if attempt is None:
-                raise HTTPException(409, "Task has no attempt")
-            con.execute("UPDATE tasks SET state='leased', updated_at=? WHERE id=?", (now(), row["id"]))
-            con.execute("UPDATE attempts SET state='leased' WHERE attempt_id=?", (attempt["attempt_id"],))
-        store.event("task.leased", row["id"], attempt["attempt_id"], {"worker_id": worker_id})
-        return {"task": json.loads(row["payload"]), "attempt_id": attempt["attempt_id"], "lease_token": attempt["lease_token"], "attempt_no": attempt["attempt_no"]}
-
-    @app.post("/api/v1/tasks/{task_id}/attempts/{attempt_id}/progress")
-    async def task_progress(task_id: str, attempt_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, str]:
-        with store.connect() as con:
-            task_row = con.execute("SELECT worker_id FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if task_row is None:
-            raise HTTPException(404, "Task not found")
-        require_node(task_row["worker_id"], authorization)
-        attempt = store.attempt(task_id, attempt_id, str(payload.get("lease_token", "")))
-        if attempt is None:
+            batch = con.execute("SELECT * FROM batch_attempts WHERE id=? AND lease_token=?", (batch_id, token)).fetchone()
+        if batch is None or batch["state"] not in {"assigned", "accepted", "running", "cancel_requested"}:
             raise HTTPException(410, "Lease expired or invalid")
-        store.apply_progress(task_id, attempt_id, payload)
+        require_node(batch["worker_id"], authorization)
+        return batch
+
+    @app.post("/api/v1/batch-attempts/{batch_id}/progress")
+    async def batch_progress(batch_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, str]:
+        batch = valid_batch(batch_id, str(payload.get("lease_token", "")), authorization)
+        phase = str(payload.get("phase", "running"))
+        if phase == "rejected":
+            store.recover_batch(batch_id, str(payload.get("error_code", "worker_rejected")))
+            return {"status": "reclaimed"}
+        with store.connect() as con:
+            if batch["state"] == "assigned":
+                con.execute("UPDATE batch_attempts SET state='accepted', accepted_at=?, lease_deadline=? WHERE id=?", (now(), (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), batch_id))
+                con.execute("UPDATE batch_attempts SET state='running', pool_json=?, pid=?, lease_deadline=? WHERE id=?",
+                            (json.dumps(payload.get("pool", {})), payload.get("pid"), (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), batch_id))
+            assigned = set(json.loads(batch["seed_json"]))
+            for run in payload.get("runs", []):
+                if not isinstance(run, dict) or run.get("seed") not in assigned:
+                    continue
+                state = str(run.get("state", "running"))
+                con.execute("UPDATE seed_runs_v2 SET state=?, fe=?, total_fe=?, elapsed_seconds=?, error=?, updated_at=? WHERE experiment_point_id=? AND seed=? AND batch_attempt_id=?",
+                            (state, int(run.get("fe", 0)), int(run.get("total_fe", 0)), float(run.get("elapsed_seconds", 0)), str(run.get("error", "")), now(), batch["experiment_point_id"], run["seed"], batch_id))
+        store.record_v2_event("batch.progress", batch["experiment_point_id"], batch_id, {"phase": phase})
         return {"status": "accepted"}
 
-    @app.post("/api/v1/tasks/{task_id}/attempts/{attempt_id}/complete")
-    async def task_complete(task_id: str, attempt_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, str]:
+    @app.post("/api/v1/batch-attempts/{batch_id}/complete")
+    async def batch_complete(batch_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, str]:
+        batch = valid_batch(batch_id, str(payload.get("lease_token", "")), authorization)
+        await batch_progress(batch_id, payload, authorization)
+        final_state = str(payload.get("state", "failed"))
         with store.connect() as con:
-            task_row = con.execute("SELECT worker_id FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if task_row is None:
-            raise HTTPException(404, "Task not found")
-        require_node(task_row["worker_id"], authorization)
-        attempt = store.attempt(task_id, attempt_id, str(payload.get("lease_token", "")))
-        if attempt is None:
-            raise HTTPException(410, "Lease expired or invalid")
-        if payload.get("runs"):
-            store.apply_progress(task_id, attempt_id, payload)
-        store.finish_attempt(task_id, attempt_id, str(payload.get("state", "failed")), payload.get("exit_code"), str(payload.get("error", "")))
+            con.execute("UPDATE batch_attempts SET state=?, finished_at=?, error=? WHERE id=?", (final_state, now(), str(payload.get("error", "")), batch_id))
+            if final_state != "completed":
+                rows = con.execute("SELECT seed, state FROM seed_runs_v2 WHERE batch_attempt_id=?", (batch_id,)).fetchall()
+                for row in rows:
+                    if row["state"] not in {"completed", "failed", "cancelled"}:
+                        recovery_state = "cancelled" if batch["state"] == "cancel_requested" or final_state == "cancelled" else "pending"
+                        con.execute("UPDATE seed_runs_v2 SET state=?, batch_attempt_id=NULL, updated_at=? WHERE experiment_point_id=? AND seed=?",
+                                    (recovery_state, now(), batch["experiment_point_id"], row["seed"]))
+            remaining = con.execute(
+                "SELECT COUNT(*) FROM seed_runs_v2 WHERE experiment_point_id=? AND state NOT IN ('completed','failed','cancelled')",
+                (batch["experiment_point_id"],),
+            ).fetchone()[0]
+            if remaining == 0:
+                con.execute("UPDATE experiment_points SET state='completed', updated_at=? WHERE id=? AND state!='cancelled'",
+                            (now(), batch["experiment_point_id"]))
+        store.record_v2_event("batch.completed", batch["experiment_point_id"], batch_id, {"state": final_state})
         return {"status": "accepted"}
 
     @app.put("/api/v1/artifacts/{artifact_id}")
-    async def upload_artifact(artifact_id: str, task_id: str = Form(...), attempt_id: str = Form(...), lease_token: str = Form(...), kind: str = Form("result"), artifact: UploadFile = File(...), authorization: str | None = Header(None)) -> dict[str, Any]:
-        with store.connect() as con:
-            attempt = con.execute("SELECT task_id FROM attempts WHERE task_id=? AND attempt_id=?", (task_id, attempt_id)).fetchone()
-            task_row = con.execute("SELECT worker_id FROM tasks WHERE id=?", (task_id,)).fetchone()
-        if attempt is None or task_row is None:
-            raise HTTPException(404, "Task attempt not found")
-        require_node(task_row["worker_id"], authorization)
-        if store.attempt(task_id, attempt_id, lease_token) is None:
-            raise HTTPException(410, "Lease expired or invalid")
+    async def upload_artifact(artifact_id: str, experiment_point_id: str = Form(...), batch_attempt_id: str = Form(...), lease_token: str = Form(...), seed: int | None = Form(None), kind: str = Form("result"), artifact: UploadFile = File(...), authorization: str | None = Header(None)) -> dict[str, Any]:
+        batch = valid_batch(batch_attempt_id, lease_token, authorization)
+        if batch["experiment_point_id"] != experiment_point_id or (seed is not None and seed not in json.loads(batch["seed_json"])):
+            raise HTTPException(422, "Artifact does not belong to this batch")
         content = await artifact.read()
-        destination = store.results_dir / task_id / attempt_id
+        destination = store.results_dir / experiment_point_id / batch_attempt_id
         destination.mkdir(parents=True, exist_ok=True)
         path = destination / Path(artifact.filename or f"{artifact_id}.bin").name
         path.write_bytes(content)
-        store.record_artifact(task_id, attempt_id, kind, path, hashlib.sha256(content).hexdigest())
-        return {"status": "stored", "artifact_id": artifact_id, "sha256": hashlib.sha256(content).hexdigest(), "size": len(content)}
+        digest = hashlib.sha256(content).hexdigest()
+        with store.connect() as con:
+            con.execute("INSERT INTO artifacts_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (artifact_id, experiment_point_id, batch_attempt_id, seed, kind, str(path), digest, len(content), now()))
+            if seed is not None:
+                con.execute("UPDATE seed_runs_v2 SET result_path=? WHERE experiment_point_id=? AND seed=? AND batch_attempt_id=?", (str(path), experiment_point_id, seed, batch_attempt_id))
+        return {"status": "stored", "artifact_id": artifact_id, "sha256": digest, "size": len(content)}
 
     @app.post("/api/v1/experiments")
     async def create_experiment(
@@ -575,8 +670,8 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
         settings_file: str = Form(""),
         settings_upload: UploadFile | None = File(None),
         worker_ids: list[str] = Form(...),
-    ) -> RedirectResponse:
-        """Create batch tasks. Workers lease and execute them asynchronously."""
+    ) -> dict[str, Any]:
+        """Create global SeedRuns. A later heartbeat assigns batch slices."""
         try:
             algorithms = json.loads(algorithms_json)
             problems = json.loads(problems_json)
@@ -587,56 +682,46 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
         if not 1 <= runs <= 1000 or retain_points < 1 or (max_workers is not None and max_workers < 1):
             raise HTTPException(400, "Runs must be between 1 and 1000")
         selected = [worker for worker in store.workers() if worker["id"] in set(worker_ids)]
-        online = sorted((worker for worker in selected if worker["online"]),
-                        key=lambda worker: (-int(worker.get("priority", 0)), worker["created_at"]))
-        if max_workers is not None:
-            online = online[:max_workers]
-        if not online:
-            raise HTTPException(400, "Select at least one online Worker")
-        run_id = str(uuid.uuid4())
+        if not selected:
+            raise HTTPException(400, "Select at least one Worker")
+        experiment_id = str(uuid.uuid4())
         uploaded_settings = ""
         if settings_upload and settings_upload.filename:
-            settings_dir = store.uploads_dir / run_id
+            settings_dir = store.uploads_dir / experiment_id
             settings_dir.mkdir(parents=True, exist_ok=True)
             uploaded_path = settings_dir / Path(settings_upload.filename).name
             uploaded_path.write_bytes(await settings_upload.read())
             uploaded_settings = str(uploaded_path)
+        allowed_workers = [worker["id"] for worker in selected]
         planned = [(algorithm, problem) for algorithm in algorithms for problem in problems]
-        for index, (algorithm, problem) in enumerate(planned):
-            worker = online[index % len(online)]
-            task_id = str(uuid.uuid4())
-            algorithm_payload = algorithm if isinstance(algorithm, dict) else {"name": str(algorithm), "parameters": {}}
-            problem_payload = problem if isinstance(problem, dict) else {"name": str(problem), "parameters": {}}
-            problem_parameters = dict(problem_payload.get("parameters", {}))
-            payload = {
-                    "id": task_id, "run_id": run_id, "algorithm": algorithm_payload,
-                    "problem": problem_payload, "seeds": list(range(1, runs + 1)),
-                    "N": problem_parameters.get("N"), "M": problem_parameters.get("M"), "D": problem_parameters.get("D"),
-                    "max_fe": int(problem_parameters.get("maxFE", problem_parameters.get("max_fe", 50000)) or 50000),
-                    "max_workers": max_workers, "retain_points": retain_points,
-                    "cluster_profile": "local", "settings_file": uploaded_settings or settings_file, "created_at": now(),
-            }
-            with store.connect() as con:
-                con.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, '')",
-                            (task_id, worker["id"], "queued", json.dumps(payload), now(), now()))
-            attempt_id, _ = store.create_attempt(task_id, payload["seeds"])
-            store.event("task.created", task_id, attempt_id, {"worker_id": worker["id"], "run_id": run_id})
-        return {"run_id": run_id, "batch_count": len(planned), "worker_count": len(online)}
-
-    @app.post("/api/v1/tasks/{task_id}/cancel")
-    async def cancel_task(task_id: str) -> dict[str, str]:
+        config = {"runs": runs, "retain_points": retain_points, "settings_file": uploaded_settings or settings_file,
+                  "allowed_workers": allowed_workers}
         with store.connect() as con:
-            row = con.execute("SELECT state FROM tasks WHERE id=?", (task_id,)).fetchone()
+            con.execute("INSERT INTO experiments VALUES (?, 'running', ?, ?, ?, ?)",
+                        (experiment_id, json.dumps(config), max_workers, now(), now()))
+            for index, (algorithm, problem) in enumerate(planned):
+                point_id = str(uuid.uuid4())
+                algorithm_payload = algorithm if isinstance(algorithm, dict) else {"name": str(algorithm), "parameters": {}}
+                problem_payload = problem if isinstance(problem, dict) else {"name": str(problem), "parameters": {}}
+                problem_parameters = dict(problem_payload.get("parameters", {}))
+                con.execute("INSERT INTO experiment_points VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                            (point_id, experiment_id, index, json.dumps(algorithm_payload), json.dumps(problem_payload), json.dumps(allowed_workers), now(), now()))
+                max_fe = int(problem_parameters.get("maxFE", problem_parameters.get("max_fe", 50000)) or 50000)
+                con.executemany("INSERT INTO seed_runs_v2 (experiment_point_id, seed, state, total_fe, updated_at) VALUES (?, ?, 'pending', ?, ?)",
+                                [(point_id, seed, max_fe, now()) for seed in range(1, runs + 1)])
+        store.record_v2_event("experiment.created", experiment_id, None, {"points": len(planned), "runs": runs})
+        return {"experiment_id": experiment_id, "point_count": len(planned), "seed_count": len(planned) * runs, "worker_count": len(selected)}
+
+    @app.post("/api/v1/experiment-points/{experiment_point_id}/cancel")
+    async def cancel_point(experiment_point_id: str) -> dict[str, str]:
+        with store.connect() as con:
+            row = con.execute("SELECT id FROM experiment_points WHERE id=?", (experiment_point_id,)).fetchone()
             if row is None:
-                raise HTTPException(404, "Task not found")
-            if row["state"] == "queued":
-                con.execute("UPDATE tasks SET state='cancelled', updated_at=? WHERE id=?", (now(), task_id))
-                con.execute("UPDATE attempts SET state='cancelled', finished_at=?, error='cancelled before lease' WHERE task_id=? AND state IN ('dispatching','queued')", (now(), task_id))
-            elif row["state"] in {"leased", "running"}:
-                con.execute("UPDATE tasks SET state='cancel_requested', updated_at=? WHERE id=?", (now(), task_id))
-            else:
-                return {"status": row["state"]}
-        store.event("task.cancel_requested", task_id, None, {})
+                raise HTTPException(404, "Experiment point not found")
+            con.execute("UPDATE experiment_points SET state='cancelled', updated_at=? WHERE id=?", (now(), experiment_point_id))
+            con.execute("UPDATE seed_runs_v2 SET state='cancelled', updated_at=? WHERE experiment_point_id=? AND state='pending'", (now(), experiment_point_id))
+            con.execute("UPDATE batch_attempts SET state='cancel_requested' WHERE experiment_point_id=? AND state IN ('assigned','accepted','running')", (experiment_point_id,))
+        store.record_v2_event("point.cancel_requested", experiment_point_id, None, {})
         return {"status": "accepted"}
 
     # Vite emits immutable assets under /assets.  API routes are registered

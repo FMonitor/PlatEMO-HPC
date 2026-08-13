@@ -23,12 +23,12 @@
 
 ### 任务调度与结果
 
-- 使用数据库事务领取任务；Worker 需要 `task_id + lease_token` 才能更新对应 Attempt。
+- 使用数据库事务签发 Seed 批次；Worker 需要 `batch_attempt_id + lease_token` 才能更新对应 BatchAttempt。
 - 接收 `result.mat`、日志、指标 CSV；校验 SHA-256 和大小后标记完成。
 - 支持后置指标计算任务，避免 Worker 端因指标失败而丢失最终 MAT。
 - 支持取消：Master 不再分配、向运行 Worker 发取消请求、保留中间日志。
 - 当前批次调度采用 Master 分配：Master 为每个算法-问题组合创建全局 `SeedRun` 队列，不将问题绑定某个 Worker。Worker 心跳仅上报批次槽位和并行池容量；Master 在心跳响应中以事务选择兼容的待运行 Seed，签发 `batch_attempt_id + lease_token`。运行中每个 Seed 的 FE、总 FE、耗时和错误写入 `seed_runs`，批次汇总写入 `batch_attempts`，MAT/日志写入 `artifacts`。
-- Worker 注册使用 `worker_join_token` 换取独立 `node_token`；Node Token 只用于该节点心跳、租约、进度、完成与产物请求，UI 接口永不返回 Token。
+- Worker 注册使用 `worker_join_token` 换取独立 `node_token`；Node Token 只用于该节点心跳、批次进度、完成与产物请求，UI 接口永不返回 Token。
 - WatchDog 每 10 秒检查心跳；连续三次 10 秒周期无有效心跳时标记 Worker 为 `suspect`，只回收其批次内 `leased/running` 的未完成 Seed，已完成 Seed 保留，二者均记录审计事件。
 
 ## Vue 前端 UI
@@ -64,15 +64,15 @@ rate = delta_FE / delta_time
 ETA = (total_FE - FE) / rate
 ```
 
-当 FE 不增长、速率不足或 Worker 心跳过期时，ETA 显示“估算中/无数据/失联”，不得显示错误的有限时间。UI 更新通过 WebSocket 事件，不超过每秒一次的同 Task 合并更新。
+当 FE 不增长、速率不足或 Worker 心跳过期时，ETA 显示“估算中/无数据/失联”，不得显示错误的有限时间。UI 更新通过 WebSocket 事件，不超过每秒一次的同 SeedRun 合并更新。
 
 ## WatchDog
 
-- Master 每个心跳周期检查所有租约中的 Task。
+- Master 每个心跳周期检查所有 BatchAttempt 租约。
 - Worker 应每 10 秒上报心跳；连续 3 次未收到有效心跳（即“失联三次”），或租约过期且无法续租，则 Worker 标为 `suspect/offline`。
-- 仅回收未确认完成的 Task；若 Worker 恢复后继续上传，Master 必须拒绝过期 `lease_token` 的状态写入，结果保留为孤儿产物供人工审查。
-- 回收后将 Task 置回 `queued`，`attempt_no + 1`，排除刚失联 Worker，按重试策略投递其它节点。
-- 达到 `max_attempts` 后置 `failed`，不无限重试。
+- 仅回收 BatchAttempt 中未确认完成的 SeedRun；若 Worker 恢复后继续上传，Master 必须拒绝过期 `lease_token` 的状态写入，结果保留为孤儿产物供人工审查。
+- 回收后仅将未完成 SeedRun 置回 `pending`，创建新的 BatchAttempt，并在退避期内排除刚失联 Worker；已完成 SeedRun 不得重跑。
+- 用户取消才将 SeedRun 置为 `cancelled`。Worker 进程失败、拒绝 assignment 或失联时，未完成 SeedRun 仍回到 `pending`；达到每个 Seed 的 `max_attempts` 后才置为 `failed`。
 - 每次探测、回收、重新分配均记录审计事件并推送 UI 告警。
 ## v1 调度实现
 
