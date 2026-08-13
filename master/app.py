@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sqlite3
 import uuid
@@ -35,7 +36,9 @@ class Store:
             con.executescript("""
                 CREATE TABLE IF NOT EXISTS workers (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL,
-                    token TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+                    token TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+                    online INTEGER NOT NULL DEFAULT 0, queue_count INTEGER,
+                    last_check TEXT NOT NULL DEFAULT '', health_error TEXT NOT NULL DEFAULT ''
                 );
                 CREATE TABLE IF NOT EXISTS tasks (
                     id TEXT PRIMARY KEY, worker_id TEXT, state TEXT NOT NULL,
@@ -43,6 +46,16 @@ class Store:
                     error TEXT NOT NULL DEFAULT ''
                 );
             """)
+            # Existing databases from the first scaffold do not have health columns.
+            columns = {row["name"] for row in con.execute("PRAGMA table_info(workers)")}
+            for name, definition in (
+                ("online", "INTEGER NOT NULL DEFAULT 0"),
+                ("queue_count", "INTEGER"),
+                ("last_check", "TEXT NOT NULL DEFAULT ''"),
+                ("health_error", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                if name not in columns:
+                    con.execute(f"ALTER TABLE workers ADD COLUMN {name} {definition}")
 
     def connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.db_path)
@@ -57,29 +70,52 @@ class Store:
         with self.connect() as con:
             return [dict(row) for row in con.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 100")]
 
+    def update_health(self, worker_id: str, online: bool, queue_count: int | None, error: str) -> None:
+        with self.connect() as con:
+            con.execute("UPDATE workers SET online = ?, queue_count = ?, last_check = ?, health_error = ? WHERE id = ?",
+                        (int(online), queue_count, now(), error, worker_id))
+
 
 def create_app(data_dir: Path) -> FastAPI:
     store = Store(data_dir)
     app = FastAPI(title="PlatEMO HPC Master")
     app.state.store = store
 
+    async def probe_worker(worker: dict[str, Any]) -> dict[str, Any]:
+        headers = {"X-Worker-Token": worker["token"]} if worker["token"] else {}
+        try:
+            async with httpx.AsyncClient(timeout=3) as client:
+                response = await client.get(f"{worker['url']}/api/health", headers=headers)
+                response.raise_for_status()
+                health = response.json()
+            store.update_health(worker["id"], True, int(health.get("queued", 0)), "")
+        except httpx.HTTPError as exc:
+            store.update_health(worker["id"], False, None, str(exc))
+        return next(item for item in store.workers() if item["id"] == worker["id"])
+
+    async def probe_all_forever() -> None:
+        while True:
+            workers = store.workers()
+            if workers:
+                await asyncio.gather(*(probe_worker(worker) for worker in workers))
+            await asyncio.sleep(30)
+
+    @app.on_event("startup")
+    async def start_health_probes() -> None:
+        app.state.probe_task = asyncio.create_task(probe_all_forever())
+
+    @app.on_event("shutdown")
+    async def stop_health_probes() -> None:
+        app.state.probe_task.cancel()
+        try:
+            await app.state.probe_task
+        except asyncio.CancelledError:
+            pass
+
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request, message: str = "") -> HTMLResponse:
-        workers = store.workers()
-        async with httpx.AsyncClient(timeout=3) as client:
-            for worker in workers:
-                headers = {"X-Worker-Token": worker["token"]} if worker["token"] else {}
-                try:
-                    response = await client.get(f"{worker['url']}/api/health", headers=headers)
-                    response.raise_for_status()
-                    health = response.json()
-                    worker.update({"online": True, "queue_count": health.get("queued", 0),
-                                   "last_check": now(), "health_error": ""})
-                except httpx.HTTPError as exc:
-                    worker.update({"online": False, "queue_count": "-", "last_check": now(),
-                                   "health_error": str(exc)})
         return templates.TemplateResponse(request, "index.html", {
-            "workers": workers, "tasks": store.tasks(), "data_dir": str(data_dir), "message": message,
+            "workers": store.workers(), "tasks": store.tasks(), "data_dir": str(data_dir), "message": message,
         })
 
     @app.get("/api/workers")
@@ -90,9 +126,18 @@ def create_app(data_dir: Path) -> FastAPI:
     async def add_worker(request: Request, name: str = Form(...), url: str = Form(...), token: str = Form("")) -> RedirectResponse:
         worker_id = str(uuid.uuid4())
         with store.connect() as con:
-            con.execute("INSERT INTO workers VALUES (?, ?, ?, ?, ?)",
+            con.execute("INSERT INTO workers (id, name, url, token, created_at) VALUES (?, ?, ?, ?, ?)",
                         (worker_id, name, url.rstrip("/"), token, now()))
         return RedirectResponse(url=f"/?message=Worker+added%3A+{worker_id}", status_code=303)
+
+    @app.post("/api/workers/{worker_id}/probe")
+    async def probe_one(worker_id: str) -> RedirectResponse:
+        worker = next((item for item in store.workers() if item["id"] == worker_id), None)
+        if worker is None:
+            raise HTTPException(404, "Worker not found")
+        result = await probe_worker(worker)
+        message = "Worker+is+online" if result["online"] else "Worker+is+offline"
+        return RedirectResponse(url=f"/?message={message}", status_code=303)
 
     @app.post("/api/workers/{worker_id}/delete")
     async def delete_worker(worker_id: str) -> RedirectResponse:
