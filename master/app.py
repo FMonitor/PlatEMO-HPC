@@ -104,6 +104,8 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
         result = []
         class_re = re.compile(r"^\s*classdef(?:\s*\([^\n)]*\))?\s+(\w+)\s*<\s*([\w.]+)", re.I | re.M)
         parameter_re = re.compile(r"ParameterSet\s*\((.*?)\)", re.I | re.S)
+        metadata_re = re.compile(r"^\s*%\s*([A-Za-z_]\w*)\s+---\s+(.+?)\s+---", re.M)
+        assignment_re = re.compile(r"if\s+isempty\(obj\.(M|D)\).*?obj\.\1\s*=\s*([^;]+);", re.I | re.S)
         for path in root.rglob("*.m"):
             if path.stem.startswith("@") or path.stem != path.name[:-2]:
                 continue
@@ -115,12 +117,16 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
             if not match or match.group(1) != path.stem or match.group(2).split(".")[-1].lower() != base_type.lower():
                 continue
             parameters = []
-            call = next(iter(parameter_re.findall(source)), "")
-            pieces = [piece.strip() for piece in call.replace("...", "").split(",")]
-            for index in range(0, len(pieces) - 1, 3):
-                name = pieces[index].strip("'\"")
-                if re.fullmatch(r"[A-Za-z_]\w*", name):
-                    parameters.append({"name": name, "default": pieces[index + 1]})
+            metadata = {name: default.strip() for name, default in metadata_re.findall(source)}
+            for name, default in metadata.items():
+                parameters.append({"name": name, "default": default})
+            for name, default in assignment_re.findall(source):
+                if not any(item["name"].lower() == name.lower() for item in parameters):
+                    parameters.append({"name": name, "default": default.strip()})
+            if not parameters:
+                call = next(iter(parameter_re.findall(source)), "")
+                pieces = [piece.strip() for piece in call.replace("...", "").split(",")]
+                parameters = [{"name": f"参数{index + 1}", "default": value} for index, value in enumerate(pieces) if value]
             result.append({"name": path.stem, "parameters": parameters})
         return sorted(result, key=lambda item: item["name"].lower())
 
@@ -277,6 +283,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
         max_workers: int | None = Form(None),
         retain_points: int = Form(100),
         settings_file: str = Form(""),
+        settings_upload: UploadFile | None = File(None),
         worker_ids: list[str] = Form(...),
     ) -> RedirectResponse:
         """Create local placeholder tasks to validate the assignment policy without MATLAB."""
@@ -296,6 +303,13 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
         if not online:
             raise HTTPException(400, "Select at least one online Worker")
         run_id = str(uuid.uuid4())
+        uploaded_settings = ""
+        if settings_upload and settings_upload.filename:
+            settings_dir = store.uploads_dir / run_id
+            settings_dir.mkdir(parents=True, exist_ok=True)
+            uploaded_path = settings_dir / Path(settings_upload.filename).name
+            uploaded_path.write_bytes(await settings_upload.read())
+            uploaded_settings = str(uploaded_path)
         planned = [(algorithm, problem, seed) for algorithm in algorithms for problem in problems for seed in range(1, runs + 1)]
         with store.connect() as con:
             for index, (algorithm, problem, seed) in enumerate(planned):
@@ -304,7 +318,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
                 payload = {
                     "id": task_id, "run_id": run_id, "mock": True, "algorithm": algorithm,
                     "problem": problem, "seed": seed, "max_workers": max_workers,
-                    "retain_points": retain_points, "settings_file": settings_file, "created_at": now(),
+                    "retain_points": retain_points, "settings_file": uploaded_settings or settings_file, "created_at": now(),
                 }
                 con.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, '')",
                             (task_id, worker["id"], "mock_queued", json.dumps(payload), now(), now()))
