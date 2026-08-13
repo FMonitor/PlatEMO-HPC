@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import re
+from io import BytesIO
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -13,7 +14,8 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from scipy.io import loadmat, savemat
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
@@ -183,6 +185,33 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
             raise HTTPException(400, "PlatEMO path does not exist")
         store.set_setting("platemo_path", str(path.resolve()))
         return RedirectResponse(url="/?message=PlatEMO+path+updated", status_code=303)
+
+    @app.post("/api/settings/load")
+    async def load_settings(settings_upload: UploadFile = File(...)) -> dict[str, Any]:
+        """Read scalar/struct values from a user-selected MATLAB settings file."""
+        if not settings_upload.filename or not settings_upload.filename.lower().endswith(".mat"):
+            raise HTTPException(400, "Select a MAT file")
+        try:
+            data = loadmat(BytesIO(await settings_upload.read()), simplify_cells=True)
+        except Exception as exc:
+            raise HTTPException(400, f"Cannot read MAT file: {exc}") from exc
+        values = {key: value for key, value in data.items() if not key.startswith("__")}
+        return {"filename": settings_upload.filename, "values": values}
+
+    @app.post("/api/settings/save")
+    async def save_settings(config_json: str = Form(...), filename: str = Form("PlatEMO-settings.mat")) -> StreamingResponse:
+        try:
+            config = json.loads(config_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, "Invalid settings configuration") from exc
+        clean_name = Path(filename).name
+        if not clean_name.lower().endswith(".mat"):
+            clean_name += ".mat"
+        output = BytesIO()
+        savemat(output, {"settings": config})
+        output.seek(0)
+        return StreamingResponse(output, media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{clean_name}"'})
 
     @app.get("/api/workers")
     async def list_workers() -> list[dict[str, Any]]:
