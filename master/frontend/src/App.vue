@@ -1,12 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { FileUp, FolderCog, Pencil, Plus, RefreshCw, Save, Search, Server, Trash2, X } from '@lucide/vue'
 import { api } from './api'
 import type { CatalogItem, ExistingTest, ExperimentItem, ImportedSettings, Worker } from './types'
 
 const algorithms = ref<CatalogItem[]>([])
 const problems = ref<CatalogItem[]>([])
-const settings = ref<{ filename: string; name: string }[]>([])
 const existingTests = ref<ExistingTest[]>([])
 const selectedExistingTestKeys = ref<string[]>([])
 const workers = ref<Worker[]>([])
@@ -15,7 +14,6 @@ const selectedProblems = ref<ExperimentItem[]>([])
 const checkedWorkers = ref<string[]>([])
 const algorithmSearch = ref('')
 const problemSearch = ref('')
-const selectedSetting = ref('')
 const platemoPath = ref('')
 const runs = ref(30)
 const maxWorkers = ref<number | null>(null)
@@ -29,6 +27,29 @@ const notice = ref('')
 const error = ref('')
 const importedDiagnostics = ref<string[]>([])
 const uploadInput = ref<HTMLInputElement | null>(null)
+const workspace = ref<HTMLElement | null>(null)
+const columnWidths = ref({ catalog: 300, editor: 360 })
+const catalogHeights = ref({ algorithms: 154, problems: 154, settings: 154 })
+
+type ColumnResizeTarget = 'catalog' | 'editor'
+type CatalogResizeTarget = 'algorithms' | 'problems'
+
+type ResizeState =
+  | { direction: 'column'; target: ColumnResizeTarget; origin: number; widths: { catalog: number; editor: number } }
+  | { direction: 'row'; target: CatalogResizeTarget; origin: number; heights: { algorithms: number; problems: number; settings: number } }
+
+const resizeState = ref<ResizeState | null>(null)
+
+const workspaceStyle = computed(() => ({
+  '--catalog-width': `${columnWidths.value.catalog}px`,
+  '--editor-width': `${columnWidths.value.editor}px`,
+}))
+
+const catalogStyle = computed(() => ({
+  '--algorithm-height': `${catalogHeights.value.algorithms}px`,
+  '--problem-height': `${catalogHeights.value.problems}px`,
+  '--settings-height': `${catalogHeights.value.settings}px`,
+}))
 
 const filteredAlgorithms = computed(() => filterCatalog(algorithms.value, algorithmSearch.value))
 const filteredProblems = computed(() => filterCatalog(problems.value, problemSearch.value))
@@ -42,6 +63,87 @@ function existingTestKey(test: ExistingTest) {
 function filterCatalog(items: CatalogItem[], query: string) {
   const normalized = query.trim().toLowerCase()
   return normalized ? items.filter((item) => item.name.toLowerCase().includes(normalized)) : items
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(Math.max(value, minimum), Math.max(minimum, maximum))
+}
+
+function stopResize() {
+  resizeState.value = null
+  document.body.classList.remove('is-resizing')
+  window.removeEventListener('pointermove', resize)
+  window.removeEventListener('pointerup', stopResize)
+}
+
+function resize(event: PointerEvent) {
+  const state = resizeState.value
+  if (!state) return
+
+  if (state.direction === 'column') {
+    const width = workspace.value?.clientWidth ?? 1000
+    const minimumPlanWidth = 340
+    const handleWidth = 16
+    const delta = event.clientX - state.origin
+
+    if (state.target === 'catalog') {
+      columnWidths.value.catalog = clamp(state.widths.catalog + delta, 270, width - state.widths.editor - minimumPlanWidth - handleWidth)
+    } else {
+      columnWidths.value.editor = clamp(state.widths.editor + delta, 320, width - state.widths.catalog - minimumPlanWidth - handleWidth)
+    }
+    return
+  }
+
+  const delta = event.clientY - state.origin
+  const minimumAlgorithmHeight = 120
+  const minimumProblemHeight = 120
+  const minimumSettingsHeight = 142
+
+  if (state.target === 'algorithms') {
+    const next = clamp(
+      state.heights.algorithms + delta,
+      minimumAlgorithmHeight,
+      state.heights.algorithms + state.heights.problems - minimumProblemHeight,
+    )
+    catalogHeights.value = {
+      ...state.heights,
+      algorithms: next,
+      problems: state.heights.problems - (next - state.heights.algorithms),
+    }
+    return
+  }
+
+  if (state.target === 'problems') {
+    const next = clamp(
+      state.heights.problems + delta,
+      minimumProblemHeight,
+      state.heights.problems + state.heights.settings - minimumSettingsHeight,
+    )
+    catalogHeights.value = {
+      ...state.heights,
+      problems: next,
+      settings: state.heights.settings - (next - state.heights.problems),
+    }
+    return
+  }
+}
+
+function startColumnResize(target: ColumnResizeTarget, event: PointerEvent) {
+  event.preventDefault()
+  stopResize()
+  resizeState.value = { direction: 'column', target, origin: event.clientX, widths: { ...columnWidths.value } }
+  document.body.classList.add('is-resizing')
+  window.addEventListener('pointermove', resize)
+  window.addEventListener('pointerup', stopResize, { once: true })
+}
+
+function startCatalogResize(target: CatalogResizeTarget, event: PointerEvent) {
+  event.preventDefault()
+  stopResize()
+  resizeState.value = { direction: 'row', target, origin: event.clientY, heights: { ...catalogHeights.value } }
+  document.body.classList.add('is-resizing')
+  window.addEventListener('pointermove', resize)
+  window.addEventListener('pointerup', stopResize, { once: true })
 }
 
 function makeItem(item: CatalogItem, prefix: string): ExperimentItem {
@@ -85,7 +187,6 @@ async function loadCatalog() {
   const catalog = await api.catalog()
   algorithms.value = catalog.algorithms
   problems.value = catalog.problems
-  settings.value = catalog.settings
   existingTests.value = catalog.existing_tests
   platemoPath.value = catalog.platemo_path
 }
@@ -128,19 +229,6 @@ async function savePlatemoPath() {
     notice.value = 'PlatEMO 目录已解析。'
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '设置 PlatEMO 路径失败'
-  } finally {
-    busy.value = false
-  }
-}
-
-async function previewSelectedSetting() {
-  if (!selectedSetting.value) return
-  busy.value = true
-  error.value = ''
-  try {
-    applyImported(await api.previewSetting(selectedSetting.value))
-  } catch (caught) {
-    error.value = caught instanceof Error ? caught.message : '读取预设失败'
   } finally {
     busy.value = false
   }
@@ -260,6 +348,7 @@ async function startMock() {
 }
 
 onMounted(refreshAll)
+onBeforeUnmount(stopResize)
 </script>
 
 <template>
@@ -268,30 +357,32 @@ onMounted(refreshAll)
     <div class="header-status"><button class="header-button" type="button" @click="showPlatemoForm = true"><FolderCog :size="16" /> PlatEMO 路径</button><span class="status-dot"></span>{{ workers.filter((worker) => worker.online).length }} 个节点在线</div>
   </header>
 
-  <main class="workspace">
-    <aside class="catalog-panel">
-      <section class="catalog-section">
+  <main ref="workspace" class="workspace" :style="workspaceStyle">
+    <aside class="catalog-panel" :style="catalogStyle">
+      <section class="catalog-section catalog-pane">
         <div class="section-title">可用算法 <label class="search-field"><Search :size="15" /><input v-model="algorithmSearch" placeholder="搜索算法" /></label></div>
         <div class="catalog-list" role="listbox">
           <button v-for="item in filteredAlgorithms" :key="item.name" class="catalog-item" type="button" @click="addAlgorithm(item)">{{ item.name }}</button>
         </div>
       </section>
+      <div class="row-resizer" title="拖拽调整算法与问题区域高度" @pointerdown="startCatalogResize('algorithms', $event)"><span></span></div>
 
-      <section class="catalog-section">
+      <section class="catalog-section catalog-pane">
         <div class="section-title">可用问题 <label class="search-field"><Search :size="15" /><input v-model="problemSearch" placeholder="搜索问题" /></label></div>
         <div class="catalog-list" role="listbox">
           <button v-for="item in filteredProblems" :key="item.name" class="catalog-item" type="button" @click="addProblem(item)">{{ item.name }}</button>
         </div>
       </section>
+      <div class="row-resizer" title="拖拽调整问题与执行设置区域高度" @pointerdown="startCatalogResize('problems', $event)"><span></span></div>
 
-      <section class="catalog-section settings-section">
+      <section class="catalog-section catalog-pane settings-section">
         <div class="section-title">执行设置</div>
         <label class="setting-field"><span>每个测试点运行次数</span><input v-model.number="runs" min="1" max="1000" type="number" /></label>
         <label class="setting-field"><span>单个任务最大 Worker 数</span><input v-model.number="maxWorkers" min="1" type="number" placeholder="不限" /></label>
         <label class="setting-field"><span>每次运行保留数据点</span><input v-model.number="retainPoints" min="1" type="number" /></label>
       </section>
 
-      <section class="catalog-section worker-section">
+      <section class="catalog-section catalog-pane worker-section">
         <div class="section-title">Worker 选择
           <span class="title-actions"><button title="探测全部 Worker" class="icon-button" type="button" :disabled="busy" @click="refreshWorkers"><RefreshCw :size="16" /></button><button title="添加 Worker" class="icon-button" type="button" @click="openAddWorker"><Plus :size="17" /></button></span>
         </div>
@@ -307,10 +398,10 @@ onMounted(refreshAll)
         </div>
       </section>
     </aside>
+    <div class="column-resizer" title="拖拽调整左列宽度" @pointerdown="startColumnResize('catalog', $event)"><span></span></div>
 
     <section class="editor-panel">
       <div class="editor-heading"><h1>运行列表与参数设置</h1><div class="settings-actions"><button class="outline-button" type="button" @click="uploadInput?.click()"><FileUp :size="16" /> 导入</button><button class="outline-button" type="button" @click="saveNativeSetting"><Save :size="16" /> 保存</button><input ref="uploadInput" class="visually-hidden" type="file" accept=".mat" @change="importFile" /></div></div>
-      <div class="preset-row"><label>实验预设<select v-model="selectedSetting" @change="previewSelectedSetting"><option value="">不使用预设</option><option v-for="setting in settings" :key="setting.filename" :value="setting.filename">{{ setting.name }}</option></select></label><span>导入 PlatEMO `Setting*.mat`；保存为 Master 原生 MAT。</span></div>
       <p v-if="importedDiagnostics.length" class="warning">{{ importedDiagnostics.join('；') }}</p>
       <div class="editor-scroll">
         <h2>已选算法</h2>
@@ -328,6 +419,7 @@ onMounted(refreshAll)
         <p v-if="!selectedProblems.length" class="empty-text">问题可重复加入，以建立不同参数规模的测试实例。</p>
       </div>
     </section>
+    <div class="column-resizer" title="拖拽调整中间列宽度" @pointerdown="startColumnResize('editor', $event)"><span></span></div>
 
     <section class="plan-panel">
       <div class="plan-toolbar"><button class="primary-button" type="button" :disabled="busy" @click="startMock">启动模拟任务</button><button class="outline-button" type="button" :disabled="busy" @click="refreshAll"><RefreshCw :size="16" /> 刷新目录</button></div>
