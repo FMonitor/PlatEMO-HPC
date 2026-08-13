@@ -135,11 +135,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=Path.cwd() / "Data")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=6000)
+    # Chromium blocks port 6000 as unsafe, so use a nearby browser-safe default.
+    parser.add_argument("--port", type=int, default=6080)
     args = parser.parse_args()
     uvicorn.run(create_app(args.data_dir.resolve()), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
     main()
-

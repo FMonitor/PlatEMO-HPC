@@ -3,7 +3,6 @@
   "matlab_exe": "H:\\Matlab\\bin\\matlab.exe",
   "data_dir": "Data",
   "worker_token": "change-this-before-exposing-on-zerotier",
-  "master_url": "http://MASTER_ZEROTIER_IP:6000",
+  "master_url": "http://MASTER_ZEROTIER_IP:6080",
   "auto_run": false
 }
-

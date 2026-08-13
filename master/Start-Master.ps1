@@ -2,7 +2,7 @@
 param(
     [string]$DataDir = (Join-Path $PSScriptRoot 'Data'),
     [string]$HostAddress = '0.0.0.0',
-    [int]$Port = 6000,
+    [int]$Port = 6080,
     [switch]$SkipInstall
 )
 

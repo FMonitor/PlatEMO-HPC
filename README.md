@@ -4,7 +4,7 @@ Personal, lightweight task dispatch for PlatEMO experiments. It does not use MAT
 
 ## Layout
 
-- `master/`: Web UI and task/result index. Listens on port `6000`.
+- `master/`: Web UI and task/result index. Listens on port `6080` (browser-safe).
 - `worker/`: Copy this directory to the root of every PlatEMO checkout. Listens on port `6001`.
 
 ## Quick start
@@ -16,7 +16,7 @@ cd F:\Code\python\Platemo-HPC\master
 .\Start-Master.ps1 -DataDir D:\PlatemoHpcData
 ```
 
-Open `http://127.0.0.1:6000`, add Worker URLs such as `http://10.147.17.23:6001`, then create a task.
+Open `http://127.0.0.1:6080`, add Worker URLs such as `http://10.147.17.23:6001`, then create a task.
 
 On each compute node, copy `worker/` to `<PlatEMO_ROOT>\worker`, configure it, and run it:
 
