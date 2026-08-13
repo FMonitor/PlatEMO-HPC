@@ -526,9 +526,11 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
     def assign_batch(worker_id: str, capacity: dict[str, Any]) -> dict[str, Any] | None:
         """Atomically choose pending seeds and issue one BatchAttempt for a heartbeat."""
         available_slots = int(capacity.get("available_batch_slots", 0) or 0)
-        if available_slots < 1:
+        configured_pool_workers = int(capacity.get("configured_pool_workers", 0) or 0)
+        max_seeds_per_batch = int(capacity.get("max_seeds_per_batch", 0) or 0)
+        if available_slots < 1 or configured_pool_workers < 1 or max_seeds_per_batch < 1:
             return None
-        batch_size = max(1, min(int(capacity.get("max_seeds_per_batch", 1) or 1), 10_000))
+        batch_size = min(max_seeds_per_batch, configured_pool_workers, 10_000)
         with store.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             worker = con.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
@@ -603,15 +605,16 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                 if not isinstance(running, dict):
                     continue
                 batch_id = str(running.get("batch_attempt_id", ""))
-                if not batch_id:
+                lease_token = str(running.get("lease_token", ""))
+                if not batch_id or not lease_token:
                     continue
                 con.execute(
-                    "UPDATE batch_attempts SET pid=?, pool_json=?, lease_deadline=? WHERE id=? AND worker_id=? AND state IN ('assigned','accepted','running')",
+                    "UPDATE batch_attempts SET pid=?, pool_json=?, lease_deadline=? WHERE id=? AND worker_id=? AND lease_token=? AND state IN ('assigned','accepted','running')",
                     (running.get("matlab_pid", running.get("pid")), json.dumps({
                         "configured_pool_workers": running.get("configured_pool_workers", capacity["configured_pool_workers"]),
                         "actual_pool_workers": running.get("actual_pool_workers", capacity["actual_pool_workers"]),
                         "pool": running.get("pool", {}),
-                    }), (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), batch_id, worker_id),
+                    }), (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), batch_id, worker_id, lease_token),
                 )
             cancelled = con.execute("SELECT id FROM batch_attempts WHERE worker_id=? AND state='cancel_requested'", (worker_id,)).fetchall()
         assignment = assign_batch(worker_id, capacity)
@@ -619,10 +622,22 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
 
     def valid_batch(batch_id: str, token: str, authorization: str | None) -> sqlite3.Row:
         with store.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
             batch = con.execute("SELECT * FROM batch_attempts WHERE id=? AND lease_token=?", (batch_id, token)).fetchone()
+            if batch is not None:
+                worker = con.execute("SELECT node_token FROM workers WHERE id=?", (batch["worker_id"],)).fetchone()
+                supplied = authorization[7:] if authorization and authorization.lower().startswith("bearer ") else ""
+                if worker is None or supplied != worker["node_token"]:
+                    con.execute("ROLLBACK")
+                    raise HTTPException(401, "Invalid node token")
+            if batch is not None and batch["state"] in {"assigned", "accepted", "running", "cancel_requested"} and batch["lease_deadline"] <= now():
+                con.execute("ROLLBACK")
+                store.recover_batch(batch_id, "lease deadline expired")
+                store.record_v2_event("batch.reclaimed", batch["experiment_point_id"], batch_id, {"reason": "lease_deadline_expired"})
+                raise HTTPException(410, "Lease expired or invalid")
+            con.execute("COMMIT")
         if batch is None or batch["state"] not in {"assigned", "accepted", "running", "cancel_requested"}:
             raise HTTPException(410, "Lease expired or invalid")
-        require_node(batch["worker_id"], authorization)
         return batch
 
     @app.post("/api/v1/batch-attempts/{batch_id}/progress")

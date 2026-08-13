@@ -67,6 +67,8 @@ Master 的响应：
 
 每个有效 progress 和运行中 heartbeat 都刷新批次的租约截止时间，并持久化 MATLAB PID、配置/实际 pool 大小和池摘要；WatchDog 只依据刷新后的截止时间判断失联。
 
+Master 只接受携带正确 `lease_token` 的 `running_batches[]` 续租。并且所有 progress、artifact、complete 写入都必须原子确认租约尚未过期；已过期的 BatchAttempt 在首个旧请求时立刻回收未完成 Seed 并返回 `410`，不能由 WatchDog 周期窗口或旧进度复活。Worker 声明零批次槽位、零配置池大小或零单批 Seed 上限时，Master 不签发 assignment。
+
 ## Master 必须实现
 
 1. 数据模型：增加 `experiment_points`、Seed 级的 `seed_runs` 与 `batch_attempts`；移除实验创建时写入固定 `worker_id` 的逻辑。
@@ -81,11 +83,11 @@ Master 的响应：
 ## Worker 必须实现
 
 1. 能力探测：启动时读取 MATLAB profile 的可用 pool 上限，注册和每次心跳报告批次容量及 `max_seeds_per_batch`。
-2. 分配接收：只读取心跳响应的 `assignment`；对同一 `batch_attempt_id` 幂等，不重复启动 MATLAB。
+2. 分配接收：只读取心跳响应的 `assignment`；对同一 `batch_attempt_id` 幂等，不重复启动 MATLAB。assignment 的 `cluster_profile` 必须等于 Worker 已探测的本机 profile，否则以 `profile_unavailable` 拒绝。
 3. 批次执行：为分配的 Seed 创建独立工作目录，启动一个 MATLAB 和一个指定 profile 的 `parpool`，通过 `parfor` 执行这批 Seed。
 4. 进度：逐 Seed 发送 `queued/running/completed/failed/cancelled`、FE、MaxFE、耗时和错误；启动 pool 后上报实际 pool 大小。
 5. 完成与产物：先以 `PUT /api/v1/artifacts/{artifact_id}` 上传每个已完成 Seed 的可恢复产物或批次聚合产物，再确认 BatchAttempt 完成。通信失败时保留文件，不创建第二个 MATLAB 批次。
-6. 取消与失效：收到 `cancel_batch_attempt_ids` 或进度、产物、完成任一写入返回 `410` 时终止该 MATLAB 进程树，关闭 pool，并停止该租约的一切后续写入。仅在 Master 的用户取消指令中将未完成 Seed 报为 `cancelled`；进程失败或租约失效只报告未完成状态和错误，由 Master 恢复为 `pending`。
+6. 取消与失效：收到 `cancel_batch_attempt_ids` 时终止 MATLAB 进程树，关闭 pool，并在最终 progress/complete 中将每个未终态 Seed 显式报告为 `cancelled`。进度、产物、完成任一写入返回 `410` 时终止该 MATLAB 进程树并停止该租约的一切后续写入；进程失败或租约失效只报告未完成状态和错误，由 Master 恢复为 `pending`。
 7. 重启恢复：仅重新上报可通过 PID 身份确认的 BatchAttempt；不得执行本地遗留 assignment JSON。无法确认的队列和目录保留给 Master 回收，绝不自行标记完成。
 
 ## 验收条件

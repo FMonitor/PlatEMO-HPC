@@ -49,9 +49,11 @@ Worker 在空闲时以心跳报告容量；Master 在同一事务中分配 Seed 
 }
 ```
 
-Worker 收到 assignment 后，必须在同一心跳响应处理周期内完成本地校验，并在下一次 API 写入中发送 `accepted` 或 `rejected`。`accepted` 可以是首个 `progress`，其中 `phase` 为 `accepted` 或 `running`；`rejected` 必须包含稳定错误码，例如 `insufficient_disk`、`profile_unavailable` 或 `input_incompatible`。Master 在签发后一个心跳周期内未收到 `accepted`，必须使该 BatchAttempt 失效并把全部未完成 SeedRun 恢复为 `pending`。`rejected` 不启动 MATLAB；Master 记录原因并立即回收该批次。
+Worker 收到 assignment 后，必须在同一心跳响应处理周期内完成本地校验，并在下一次 API 写入中发送 `accepted` 或 `rejected`。`cluster_profile` 必须等于 Worker 已探测的本机 profile；不一致时以 `profile_unavailable` 拒绝，不得启动 MATLAB。`accepted` 可以是首个 `progress`，其中 `phase` 为 `accepted` 或 `running`；`rejected` 必须包含稳定错误码，例如 `insufficient_disk`、`profile_unavailable` 或 `input_incompatible`。Master 在签发后一个心跳周期内未收到 `accepted`，必须使该 BatchAttempt 失效并把全部未完成 SeedRun 恢复为 `pending`。`rejected` 不启动 MATLAB；Master 记录原因并立即回收该批次。
 
 `running_batches[]` 用于续租和运行态核对。每项包含 `batch_attempt_id`、`experiment_point_id`、`lease_token`、`matlab_pid`、`configured_pool_workers`、`actual_pool_workers` 与可选 pool 摘要；Master 仅更新归属该 Worker 的有效批次。
+
+Master 只在 `available_batch_slots >= 1`、`configured_pool_workers >= 1` 且 `max_seeds_per_batch >= 1` 时签发 assignment，批次大小不超过后两者的较小值。`running_batches[]` 必须携带与 BatchAttempt 一致的 `lease_token`；缺失或不匹配时 Master 不续租也不更新 PID/池状态。
 
 ```json
 {
@@ -88,9 +90,11 @@ Worker 收到 assignment 后，必须在同一心跳响应处理周期内完成�
 }
 ```
 
-完成请求包含以上最终 `runs`、`state`、`exit_code` 和可选 `error`。Worker 应先上传 `result.mat`，再发送完成确认。若进度、产物或完成收到 `410`，Worker 必须立即终止该 BatchAttempt 的 MATLAB 进程树，停止一切后续进度、产物和完成写入，并保留本地文件；不能继续执行或覆盖新租约。
+完成请求包含以上最终 `runs`、`state`、`exit_code` 和可选 `error`。若批次由 Master 取消，Worker 必须把所有非 `completed`、`failed`、`cancelled` 的 runs 显式改为 `cancelled` 后再完成确认。Worker 应先上传 `result.mat`，再发送完成确认。若进度、产物或完成收到 `410`，Worker 必须立即终止该 BatchAttempt 的 MATLAB 进程树，停止一切后续进度、产物和完成写入，并保留本地文件；不能继续执行或覆盖新租约。
 
 每次通过租约校验的 progress 都会刷新 `lease_deadline`，并持久化 PID、池状态和 Seed FE；长任务不能因首次确认后的固定截止时间被回收。
+
+`progress`、`artifact` 和 `complete` 在写入前原子校验 `lease_deadline > now()`。截止时间已到达时 Master 立即回收未完成 Seed 并返回 `410`，不能等待 WatchDog 的下一次轮询，也不能被旧 Worker 的进度重新续租。
 
 上传产物必须使用 `PUT /api/v1/artifacts/{artifact_id}`，以 multipart/form-data 传递 `experiment_point_id`、`batch_attempt_id`、`seed`、`lease_token`、`kind` 和 `artifact`；Master 存储 SHA-256 与大小。
 
