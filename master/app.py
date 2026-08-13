@@ -25,7 +25,7 @@ def now() -> str:
 
 
 class Store:
-    def __init__(self, data_dir: Path) -> None:
+    def __init__(self, data_dir: Path, platemo_path: Path | None = None) -> None:
         self.data_dir = data_dir
         self.results_dir = data_dir / "results"
         self.uploads_dir = data_dir / "uploads"
@@ -45,7 +45,13 @@ class Store:
                     payload TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     error TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY, value TEXT NOT NULL
+                );
             """)
+            if platemo_path is not None:
+                con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('platemo_path', ?)",
+                            (str(platemo_path.resolve()),))
             # Existing databases from the first scaffold do not have health columns.
             columns = {row["name"] for row in con.execute("PRAGMA table_info(workers)")}
             for name, definition in (
@@ -75,11 +81,26 @@ class Store:
             con.execute("UPDATE workers SET online = ?, queue_count = ?, last_check = ?, health_error = ? WHERE id = ?",
                         (int(online), queue_count, now(), error, worker_id))
 
+    def setting(self, key: str, default: str = "") -> str:
+        with self.connect() as con:
+            row = con.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+            return row["value"] if row else default
 
-def create_app(data_dir: Path) -> FastAPI:
-    store = Store(data_dir)
+    def set_setting(self, key: str, value: str) -> None:
+        with self.connect() as con:
+            con.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
+
+
+def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
+    store = Store(data_dir, platemo_path)
     app = FastAPI(title="PlatEMO HPC Master")
     app.state.store = store
+
+    def catalog(relative: str) -> list[str]:
+        root = Path(store.setting("platemo_path")) / relative
+        if not root.is_dir():
+            return []
+        return sorted(path.stem for path in root.rglob("*.m") if not path.stem.startswith("@"))
 
     async def probe_worker(worker: dict[str, Any]) -> dict[str, Any]:
         headers = {"X-Worker-Token": worker["token"]} if worker["token"] else {}
@@ -116,7 +137,17 @@ def create_app(data_dir: Path) -> FastAPI:
     async def index(request: Request, message: str = "") -> HTMLResponse:
         return templates.TemplateResponse(request, "index.html", {
             "workers": store.workers(), "tasks": store.tasks(), "data_dir": str(data_dir), "message": message,
+            "platemo_path": store.setting("platemo_path"),
+            "algorithms": catalog("Algorithms"), "problems": catalog("Problems"),
         })
+
+    @app.post("/api/settings/platemo-path")
+    async def set_platemo_path(platemo_path: str = Form(...)) -> RedirectResponse:
+        path = Path(platemo_path).expanduser()
+        if not path.is_dir():
+            raise HTTPException(400, "PlatEMO path does not exist")
+        store.set_setting("platemo_path", str(path.resolve()))
+        return RedirectResponse(url="/?message=PlatEMO+path+updated", status_code=303)
 
     @app.get("/api/workers")
     async def list_workers() -> list[dict[str, Any]]:
@@ -261,11 +292,12 @@ def create_app(data_dir: Path) -> FastAPI:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=Path, default=Path.cwd() / "Data")
+    parser.add_argument("--platemo-path", type=Path, default=None)
     parser.add_argument("--host", default="0.0.0.0")
     # Chromium blocks port 6000 as unsafe, so use a nearby browser-safe default.
     parser.add_argument("--port", type=int, default=6080)
     args = parser.parse_args()
-    uvicorn.run(create_app(args.data_dir.resolve()), host=args.host, port=args.port)
+    uvicorn.run(create_app(args.data_dir.resolve(), args.platemo_path), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

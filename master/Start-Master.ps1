@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$DataDir = (Join-Path $PSScriptRoot 'Data'),
+    [string]$PlatEMOPath = '',
     [string]$HostAddress = '0.0.0.0',
     [int]$Port = 6080,
     [switch]$SkipInstall
@@ -25,5 +26,7 @@ if (-not $SkipInstall -and -not (Test-Path -LiteralPath $installMarker)) {
 }
 
 New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
-& $python -m app --data-dir $DataDir --host $HostAddress --port $Port
+$arguments = @('-m', 'app', '--data-dir', $DataDir, '--host', $HostAddress, '--port', $Port)
+if ($PlatEMOPath) { $arguments += @('--platemo-path', $PlatEMOPath) }
+& $python @arguments
 Set-Location -LiteralPath $originalLocation
