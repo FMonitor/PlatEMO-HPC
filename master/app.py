@@ -431,7 +431,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
         result: list[dict[str, Any]] = []
         with store.connect() as con:
             rows = con.execute(
-                "SELECT s.*, p.algorithm_json, p.problem_json, p.created_at, b.worker_id "
+                "SELECT s.*, p.algorithm_json, p.problem_json, p.created_at, b.worker_id, b.pid, b.pool_json "
                 "FROM seed_runs_v2 s JOIN experiment_points p ON p.id=s.experiment_point_id "
                 "LEFT JOIN batch_attempts b ON b.id=s.batch_attempt_id "
                 "ORDER BY p.created_at DESC, s.seed LIMIT 500"
@@ -447,6 +447,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                 "algorithm": algorithm.get("name", ""), "problem": problem.get("name", ""), "seed": seed["seed"],
                 "parameters": parameters, "fe": seed["fe"], "total_fe": seed["total_fe"],
                 "elapsed_seconds": seed["elapsed_seconds"], "created_at": seed["created_at"], "updated_at": seed["updated_at"], "error": seed["error"],
+                "matlab_pid": seed["pid"], "pool": json.loads(seed["pool_json"] or "{}") if seed["pool_json"] else {},
             })
         return result
 
@@ -524,7 +525,10 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
 
     def assign_batch(worker_id: str, capacity: dict[str, Any]) -> dict[str, Any] | None:
         """Atomically choose pending seeds and issue one BatchAttempt for a heartbeat."""
-        batch_size = max(1, min(int(capacity.get("max_seeds_per_batch", 1)), 10_000))
+        available_slots = int(capacity.get("available_batch_slots", 0) or 0)
+        if available_slots < 1:
+            return None
+        batch_size = max(1, min(int(capacity.get("max_seeds_per_batch", 1) or 1), 10_000))
         with store.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             worker = con.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
@@ -532,7 +536,8 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                 "SELECT DISTINCT p.id FROM experiment_points p JOIN batch_attempts b ON b.experiment_point_id=p.id "
                 "WHERE b.worker_id=? AND b.state IN ('assigned','accepted','running')", (worker_id,)
             ).fetchall()
-            if worker is None or int(capacity.get("available_batch_slots", 0)) < 1:
+            if worker is None:
+                con.execute("ROLLBACK")
                 return None
             points = con.execute("SELECT * FROM experiment_points WHERE state='pending' ORDER BY created_at, ordinal").fetchall()
             for point in points:
@@ -541,6 +546,13 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                     continue
                 experiment = con.execute("SELECT max_workers FROM experiments WHERE id=? AND state='running'", (point["experiment_id"],)).fetchone()
                 if experiment is None:
+                    continue
+                experiment_config = json.loads(con.execute("SELECT config_json FROM experiments WHERE id=?", (point["experiment_id"],)).fetchone()[0])
+                worker_capabilities = json.loads(worker["capabilities_json"] or "{}")
+                requested_profile = str(experiment_config.get("cluster_profile", "") or "")
+                worker_profile = str(worker_capabilities.get("cluster_profile", "") or "")
+                assignment_profile = requested_profile or worker_profile or "local"
+                if requested_profile and worker_profile and requested_profile != worker_profile:
                     continue
                 used = con.execute(
                     "SELECT COUNT(DISTINCT b.worker_id) FROM batch_attempts b "
@@ -565,7 +577,6 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                             (batch_id, point["id"], worker_id, token, json.dumps(seed_values), now(), deadline))
                 con.executemany("UPDATE seed_runs_v2 SET state='leased', batch_attempt_id=?, attempts=attempts+1, updated_at=? WHERE experiment_point_id=? AND seed=? AND state='pending'",
                                 [(batch_id, now(), point["id"], seed) for seed in seed_values])
-                experiment_config = json.loads(con.execute("SELECT config_json FROM experiments WHERE id=?", (point["experiment_id"],)).fetchone()[0])
                 con.execute("COMMIT")
                 algorithm, problem = json.loads(point["algorithm_json"]), json.loads(point["problem_json"])
                 params = problem.get("parameters", {})
@@ -574,17 +585,34 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                         "algorithm": algorithm, "problem": problem, "seeds": seed_values,
                         "max_fe": int(params.get("maxFE", params.get("max_fe", 50000)) or 50000),
                         "retain_points": int(experiment_config.get("retain_points", 100)),
-                        "cluster_profile": "local"}
+                        "cluster_profile": assignment_profile}
             con.execute("COMMIT")
         return None
 
     @app.post("/api/v1/workers/{worker_id}/heartbeat")
     async def worker_heartbeat(worker_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, Any]:
         require_node(worker_id, authorization)
-        capacity = {key: payload.get(key, 0) for key in ("available_batch_slots", "max_concurrent_batches", "configured_pool_workers", "max_seeds_per_batch")}
+        capacity = {key: payload.get(key, 0) for key in ("available_batch_slots", "max_concurrent_batches", "configured_pool_workers", "actual_pool_workers", "max_seeds_per_batch")}
+        running_batches = payload.get("running_batches", [])
+        if not isinstance(running_batches, list):
+            raise HTTPException(422, "running_batches must be an array")
         with store.connect() as con:
             con.execute("UPDATE workers SET online=1, status='online', last_heartbeat=?, last_check=?, queue_count=?, capabilities_json=? WHERE id=?",
                         (now(), now(), int(capacity["available_batch_slots"]), json.dumps(payload.get("capabilities", {})), worker_id))
+            for running in running_batches:
+                if not isinstance(running, dict):
+                    continue
+                batch_id = str(running.get("batch_attempt_id", ""))
+                if not batch_id:
+                    continue
+                con.execute(
+                    "UPDATE batch_attempts SET pid=?, pool_json=?, lease_deadline=? WHERE id=? AND worker_id=? AND state IN ('assigned','accepted','running')",
+                    (running.get("matlab_pid", running.get("pid")), json.dumps({
+                        "configured_pool_workers": running.get("configured_pool_workers", capacity["configured_pool_workers"]),
+                        "actual_pool_workers": running.get("actual_pool_workers", capacity["actual_pool_workers"]),
+                        "pool": running.get("pool", {}),
+                    }), (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), batch_id, worker_id),
+                )
             cancelled = con.execute("SELECT id FROM batch_attempts WHERE worker_id=? AND state='cancel_requested'", (worker_id,)).fetchall()
         assignment = assign_batch(worker_id, capacity)
         return {"status": "ok", "server_time": now(), "cancel_batch_attempt_ids": [row["id"] for row in cancelled], "assignment": assignment}
@@ -607,8 +635,8 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
         with store.connect() as con:
             if batch["state"] == "assigned":
                 con.execute("UPDATE batch_attempts SET state='accepted', accepted_at=?, lease_deadline=? WHERE id=?", (now(), (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), batch_id))
-                con.execute("UPDATE batch_attempts SET state='running', pool_json=?, pid=?, lease_deadline=? WHERE id=?",
-                            (json.dumps(payload.get("pool", {})), payload.get("pid"), (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), batch_id))
+            con.execute("UPDATE batch_attempts SET state=CASE WHEN state='accepted' OR state='assigned' THEN 'running' ELSE state END, pool_json=?, pid=?, lease_deadline=? WHERE id=?",
+                        (json.dumps({"pool": payload.get("pool", {}), "actual_pool_workers": payload.get("actual_pool_workers", payload.get("pool", {}).get("workers", 0) if isinstance(payload.get("pool", {}), dict) else 0)}), payload.get("pid", payload.get("matlab_pid")), (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(), batch_id))
             assigned = set(json.loads(batch["seed_json"]))
             for run in payload.get("runs", []):
                 if not isinstance(run, dict) or run.get("seed") not in assigned:
@@ -626,13 +654,13 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
         final_state = str(payload.get("state", "failed"))
         with store.connect() as con:
             con.execute("UPDATE batch_attempts SET state=?, finished_at=?, error=? WHERE id=?", (final_state, now(), str(payload.get("error", "")), batch_id))
-            if final_state != "completed":
-                rows = con.execute("SELECT seed, state FROM seed_runs_v2 WHERE batch_attempt_id=?", (batch_id,)).fetchall()
-                for row in rows:
-                    if row["state"] not in {"completed", "failed", "cancelled"}:
-                        recovery_state = "cancelled" if batch["state"] == "cancel_requested" or final_state == "cancelled" else "pending"
-                        con.execute("UPDATE seed_runs_v2 SET state=?, batch_attempt_id=NULL, updated_at=? WHERE experiment_point_id=? AND seed=?",
-                                    (recovery_state, now(), batch["experiment_point_id"], row["seed"]))
+            rows = con.execute("SELECT seed, state FROM seed_runs_v2 WHERE batch_attempt_id=?", (batch_id,)).fetchall()
+            cancellation_requested = batch["state"] == "cancel_requested" or final_state == "cancelled"
+            for row in rows:
+                if row["state"] not in {"completed", "failed", "cancelled"}:
+                    recovery_state = "cancelled" if cancellation_requested else ("pending" if final_state != "completed" else "pending")
+                    con.execute("UPDATE seed_runs_v2 SET state=?, batch_attempt_id=NULL, updated_at=? WHERE experiment_point_id=? AND seed=?",
+                                (recovery_state, now(), batch["experiment_point_id"], row["seed"]))
             remaining = con.execute(
                 "SELECT COUNT(*) FROM seed_runs_v2 WHERE experiment_point_id=? AND state NOT IN ('completed','failed','cancelled')",
                 (batch["experiment_point_id"],),
@@ -667,6 +695,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
         runs: int = Form(30),
         max_workers: int | None = Form(None),
         retain_points: int = Form(100),
+        cluster_profile: str = Form(""),
         settings_file: str = Form(""),
         settings_upload: UploadFile | None = File(None),
         worker_ids: list[str] = Form(...),
@@ -694,7 +723,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
             uploaded_settings = str(uploaded_path)
         allowed_workers = [worker["id"] for worker in selected]
         planned = [(algorithm, problem) for algorithm in algorithms for problem in problems]
-        config = {"runs": runs, "retain_points": retain_points, "settings_file": uploaded_settings or settings_file,
+        config = {"runs": runs, "retain_points": retain_points, "cluster_profile": cluster_profile.strip(), "settings_file": uploaded_settings or settings_file,
                   "allowed_workers": allowed_workers}
         with store.connect() as con:
             con.execute("INSERT INTO experiments VALUES (?, 'running', ?, ?, ?, ?)",

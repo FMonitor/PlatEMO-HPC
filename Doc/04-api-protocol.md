@@ -51,6 +51,8 @@ Worker 在空闲时以心跳报告容量；Master 在同一事务中分配 Seed 
 
 Worker 收到 assignment 后，必须在同一心跳响应处理周期内完成本地校验，并在下一次 API 写入中发送 `accepted` 或 `rejected`。`accepted` 可以是首个 `progress`，其中 `phase` 为 `accepted` 或 `running`；`rejected` 必须包含稳定错误码，例如 `insufficient_disk`、`profile_unavailable` 或 `input_incompatible`。Master 在签发后一个心跳周期内未收到 `accepted`，必须使该 BatchAttempt 失效并把全部未完成 SeedRun 恢复为 `pending`。`rejected` 不启动 MATLAB；Master 记录原因并立即回收该批次。
 
+`running_batches[]` 用于续租和运行态核对。每项包含 `batch_attempt_id`、`experiment_point_id`、`lease_token`、`matlab_pid`、`configured_pool_workers`、`actual_pool_workers` 与可选 pool 摘要；Master 仅更新归属该 Worker 的有效批次。
+
 ```json
 {
   "cancel_batch_attempt_ids": [],
@@ -86,9 +88,11 @@ Worker 收到 assignment 后，必须在同一心跳响应处理周期内完成�
 }
 ```
 
-完成请求包含以上最终 `runs`、`state`、`exit_code` 和可选 `error`。Worker 应先上传 `result.mat`，再发送完成确认。若进度或完成收到 `410`，Worker 停止该 BatchAttempt 的后续上报并保留本地文件，不能继续执行或覆盖新租约。
+完成请求包含以上最终 `runs`、`state`、`exit_code` 和可选 `error`。Worker 应先上传 `result.mat`，再发送完成确认。若进度、产物或完成收到 `410`，Worker 必须立即终止该 BatchAttempt 的 MATLAB 进程树，停止一切后续进度、产物和完成写入，并保留本地文件；不能继续执行或覆盖新租约。
 
-上传产物以 multipart/form-data 传递 `experiment_point_id`、`batch_attempt_id`、`seed`、`lease_token`、`kind` 和 `artifact`；Master 存储 SHA-256 与大小。
+每次通过租约校验的 progress 都会刷新 `lease_deadline`，并持久化 PID、池状态和 Seed FE；长任务不能因首次确认后的固定截止时间被回收。
+
+上传产物必须使用 `PUT /api/v1/artifacts/{artifact_id}`，以 multipart/form-data 传递 `experiment_point_id`、`batch_attempt_id`、`seed`、`lease_token`、`kind` 和 `artifact`；Master 存储 SHA-256 与大小。
 
 ## Master 提供给 UI
 
@@ -105,16 +109,16 @@ Worker 收到 assignment 后，必须在同一心跳响应处理周期内完成�
 | `POST` | `/api/settings/load` | 导入 PlatEMO 或 Master 原生 MAT 设置 |
 | `POST` | `/api/settings/save` | 导出 Master 原生 MAT 设置 |
 
-实验创建请求携带算法和问题实例数组、运行次数、保留点数、可选最大 Worker 数以及选中的 Worker ID。Master 保存此集合为实验点的调度范围，在每次心跳时按优先级、占用率和轮询原子分配 Seed 批次；不预先绑定 Worker。
+实验创建请求携带算法和问题实例数组、运行次数、保留点数、可选最大 Worker 数以及选中的 Worker ID。可选 `cluster_profile` 写入实验快照；未指定时使用 Worker 能力声明的 profile。Master 仅向 profile 兼容的 Worker 分配 Seed 批次，不预先绑定 Worker。
 
 ## WatchDog 和失败语义
 
-Worker 的标准心跳间隔为 10 秒。Master 仅将签名 heartbeat 视为续租；连续三次未收到，即超过 30 秒，Worker 标记 `suspect`，该 Worker 的 BatchAttempt 中未完成 SeedRun 回到 `pending`，原 BatchAttempt 标记 `reclaimed`。用户取消才将 SeedRun 置为 `cancelled`；进程失败、assignment 拒绝或租约失效均只回收未完成 SeedRun。旧 BatchAttempt 之后的写入必定得到 `410`。
+Worker 的标准心跳间隔为 10 秒。Master 仅将签名 heartbeat 视为续租；连续三次未收到，即超过 30 秒，Worker 标记 `suspect`，该 Worker 的 BatchAttempt 中未完成 SeedRun 回到 `pending`，原 BatchAttempt 标记 `reclaimed`。用户取消才将 SeedRun 置为 `cancelled`；已 `cancel_requested` 的 BatchAttempt 即使错误上报 `completed`，未终态 Seed 仍必须强制为 `cancelled`。进程失败、assignment 拒绝或租约失效均只回收未完成 SeedRun。旧 BatchAttempt 之后的写入必定得到 `410`。
 
 | HTTP 状态 | Worker 行为 |
 | --- | --- |
 | `401` | 清除本地 Node Token，使用 Join Token 重新注册 |
 | `404` | 记录错误，保留本地产物并人工处理 |
-| `410` | 停止该 BatchAttempt 上报和执行，保留本地文件 |
+| `410` | 终止该 BatchAttempt 的 MATLAB 进程树，停止所有上报、产物和完成写入，保留本地文件 |
 | `422` | 标记任务失败，不自动重试相同输入 |
 | `429` / `503` | 指数退避重试通信，不能重复启动 MATLAB |
