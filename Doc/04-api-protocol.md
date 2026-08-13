@@ -13,6 +13,7 @@
 | `POST` | `/tasks/{taskId}/attempts/{attemptId}/complete` | Worker | 成功、失败、取消和产物元数据 |
 | `PUT` | `/artifacts/{artifactId}` | Worker | 上传 MAT/日志，支持断点续传 |
 | `GET` | `/api/catalog` | UI | 算法、问题、参数、`Setting*.mat` 与已有测试候选 |
+| `GET` | `/api/tasks` | UI | 最近 100 个任务的 Worker、算法、问题、Seed 与状态 |
 | `PUT` | `/api/platemo-path` | UI | 设置并验证 PlatEMO 根目录 |
 | `POST` | `/experiments` | UI | 创建草稿/快照 |
 | `POST` | `/experiments/{id}/start` | UI | 根据快照生成 Task |
@@ -25,6 +26,8 @@
 | `POST` | `/api/settings/save` | UI | 另存为 Master 原生实验配置 MAT |
 | `GET` | `/api/existing-tests` | UI | 返回按算法/问题/M/D 聚合的已有结果 |
 | `GET` | `/events` | UI | 历史事件与审计 |
+
+当前原型的 `/api/tasks` 不返回 Worker Token 或设置文件路径。Worker 尚未上报 FE 时，响应不伪造 `current_fe`、`max_fe` 或 ETA；前端显示“等待 FE 上报”。后续任务心跳接口会补充这些字段并以 WebSocket 推送。
 
 ## Worker 领取任务
 

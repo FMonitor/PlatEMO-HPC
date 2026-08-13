@@ -241,6 +241,31 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
     async def list_workers() -> list[dict[str, Any]]:
         return [{key: value for key, value in worker.items() if key != "token"} for worker in store.workers()]
 
+    @app.get("/api/tasks")
+    async def list_tasks() -> list[dict[str, Any]]:
+        """Return recent task attempts for the run-status panel without secrets."""
+        worker_names = {worker["id"]: worker["name"] for worker in store.workers()}
+        result: list[dict[str, Any]] = []
+        for task in store.tasks():
+            try:
+                payload = json.loads(task["payload"])
+            except json.JSONDecodeError:
+                payload = {}
+            result.append({
+                "id": task["id"],
+                "state": task["state"],
+                "worker_id": task["worker_id"],
+                "worker_name": worker_names.get(task["worker_id"], "未分配"),
+                "algorithm": payload.get("algorithm", {}).get("name", "") if isinstance(payload.get("algorithm"), dict) else payload.get("algorithm", ""),
+                "problem": payload.get("problem", {}).get("name", "") if isinstance(payload.get("problem"), dict) else payload.get("problem", ""),
+                "seed": payload.get("seed", "-"),
+                "parameters": payload.get("problem", {}).get("parameters", {}) if isinstance(payload.get("problem"), dict) else {},
+                "created_at": task["created_at"],
+                "updated_at": task["updated_at"],
+                "error": task["error"],
+            })
+        return result
+
     @app.post("/api/workers")
     async def add_worker(request: Request, name: str = Form(...), url: str = Form(...), token: str = Form("")) -> RedirectResponse:
         worker_id = str(uuid.uuid4())

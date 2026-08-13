@@ -2,12 +2,13 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { FileUp, FolderCog, Pencil, Plus, RefreshCw, Save, Search, Server, Trash2, X } from '@lucide/vue'
 import { api } from './api'
-import type { CatalogItem, ExistingTest, ExperimentItem, ImportedSettings, Worker } from './types'
+import type { CatalogItem, ExistingTest, ExperimentItem, ImportedSettings, TaskStatus, Worker } from './types'
 
 const algorithms = ref<CatalogItem[]>([])
 const problems = ref<CatalogItem[]>([])
 const existingTests = ref<ExistingTest[]>([])
 const selectedExistingTestKeys = ref<string[]>([])
+const taskStatuses = ref<TaskStatus[]>([])
 const workers = ref<Worker[]>([])
 const selectedAlgorithms = ref<ExperimentItem[]>([])
 const selectedProblems = ref<ExperimentItem[]>([])
@@ -23,38 +24,42 @@ const showPlatemoForm = ref(false)
 const editingWorker = ref<string | null>(null)
 const workerForm = ref({ name: '', url: '', token: '' })
 const busy = ref(false)
-const notice = ref('')
+const notice = ref<{ id: number; message: string } | null>(null)
 const error = ref('')
 const importedDiagnostics = ref<string[]>([])
 const uploadInput = ref<HTMLInputElement | null>(null)
 const workspace = ref<HTMLElement | null>(null)
-const columnWidths = ref({ catalog: 300, editor: 360 })
-const catalogHeights = ref({ algorithms: 154, problems: 154, settings: 154 })
+const columnWidths = ref({ catalog: 300, editor: 370, tasks: 360 })
+const catalogHeights = ref({ algorithms: 154, problems: 154 })
+let noticeId = 0
+let noticeTimer: ReturnType<typeof window.setTimeout> | undefined
+let taskRefreshTimer: ReturnType<typeof window.setInterval> | undefined
 
-type ColumnResizeTarget = 'catalog' | 'editor'
+type ColumnResizeTarget = 'catalog' | 'editor' | 'tasks'
 type CatalogResizeTarget = 'algorithms' | 'problems'
 
 type ResizeState =
-  | { direction: 'column'; target: ColumnResizeTarget; origin: number; widths: { catalog: number; editor: number } }
-  | { direction: 'row'; target: CatalogResizeTarget; origin: number; heights: { algorithms: number; problems: number; settings: number } }
+  | { direction: 'column'; target: ColumnResizeTarget; origin: number; widths: { catalog: number; editor: number; tasks: number } }
+  | { direction: 'row'; target: CatalogResizeTarget; origin: number; heights: { algorithms: number; problems: number } }
 
 const resizeState = ref<ResizeState | null>(null)
 
 const workspaceStyle = computed(() => ({
   '--catalog-width': `${columnWidths.value.catalog}px`,
   '--editor-width': `${columnWidths.value.editor}px`,
+  '--task-width': `${columnWidths.value.tasks}px`,
 }))
 
 const catalogStyle = computed(() => ({
   '--algorithm-height': `${catalogHeights.value.algorithms}px`,
   '--problem-height': `${catalogHeights.value.problems}px`,
-  '--settings-height': `${catalogHeights.value.settings}px`,
 }))
 
 const filteredAlgorithms = computed(() => filterCatalog(algorithms.value, algorithmSearch.value))
 const filteredProblems = computed(() => filterCatalog(problems.value, problemSearch.value))
 const totalTasks = computed(() => selectedAlgorithms.value.length * selectedProblems.value.length * runs.value)
 const selectedWorkerCount = computed(() => checkedWorkers.value.length)
+const activeTaskCount = computed(() => taskStatuses.value.filter((task) => !['completed', 'failed', 'cancelled'].includes(task.state)).length)
 
 function existingTestKey(test: ExistingTest) {
   return `${test.algorithm}:${test.problem}:M${test.M}:D${test.D}`
@@ -67,6 +72,15 @@ function filterCatalog(items: CatalogItem[], query: string) {
 
 function clamp(value: number, minimum: number, maximum: number) {
   return Math.min(Math.max(value, minimum), Math.max(minimum, maximum))
+}
+
+function showNotice(message: string) {
+  if (noticeTimer) window.clearTimeout(noticeTimer)
+  notice.value = { id: ++noticeId, message }
+  noticeTimer = window.setTimeout(() => {
+    notice.value = null
+    noticeTimer = undefined
+  }, 4600)
 }
 
 function stopResize() {
@@ -82,14 +96,16 @@ function resize(event: PointerEvent) {
 
   if (state.direction === 'column') {
     const width = workspace.value?.clientWidth ?? 1000
-    const minimumPlanWidth = 340
-    const handleWidth = 16
+    const minimumExistingWidth = 250
+    const handleWidth = 24
     const delta = event.clientX - state.origin
 
     if (state.target === 'catalog') {
-      columnWidths.value.catalog = clamp(state.widths.catalog + delta, 270, width - state.widths.editor - minimumPlanWidth - handleWidth)
+      columnWidths.value.catalog = clamp(state.widths.catalog + delta, 270, width - state.widths.editor - state.widths.tasks - minimumExistingWidth - handleWidth)
+    } else if (state.target === 'editor') {
+      columnWidths.value.editor = clamp(state.widths.editor + delta, 330, width - state.widths.catalog - state.widths.tasks - minimumExistingWidth - handleWidth)
     } else {
-      columnWidths.value.editor = clamp(state.widths.editor + delta, 320, width - state.widths.catalog - minimumPlanWidth - handleWidth)
+      columnWidths.value.tasks = clamp(state.widths.tasks + delta, 300, width - state.widths.catalog - state.widths.editor - minimumExistingWidth - handleWidth)
     }
     return
   }
@@ -97,33 +113,13 @@ function resize(event: PointerEvent) {
   const delta = event.clientY - state.origin
   const minimumAlgorithmHeight = 120
   const minimumProblemHeight = 120
-  const minimumSettingsHeight = 142
-
   if (state.target === 'algorithms') {
-    const next = clamp(
-      state.heights.algorithms + delta,
-      minimumAlgorithmHeight,
-      state.heights.algorithms + state.heights.problems - minimumProblemHeight,
-    )
-    catalogHeights.value = {
-      ...state.heights,
-      algorithms: next,
-      problems: state.heights.problems - (next - state.heights.algorithms),
-    }
+    catalogHeights.value = { ...state.heights, algorithms: Math.max(minimumAlgorithmHeight, state.heights.algorithms + delta) }
     return
   }
 
   if (state.target === 'problems') {
-    const next = clamp(
-      state.heights.problems + delta,
-      minimumProblemHeight,
-      state.heights.problems + state.heights.settings - minimumSettingsHeight,
-    )
-    catalogHeights.value = {
-      ...state.heights,
-      problems: next,
-      settings: state.heights.settings - (next - state.heights.problems),
-    }
+    catalogHeights.value = { ...state.heights, problems: Math.max(minimumProblemHeight, state.heights.problems + delta) }
     return
   }
 }
@@ -180,7 +176,7 @@ function applyImported(values: ImportedSettings) {
   runs.value = Number(values.runs) || 30
   retainPoints.value = Number(values.retain_results) || 1
   importedDiagnostics.value = values.diagnostics
-  notice.value = `已加载 ${values.source}：${values.algorithms.length} 个算法、${values.problems.length} 个问题实例。`
+  showNotice(`已加载 ${values.source}：${values.algorithms.length} 个算法、${values.problems.length} 个问题实例。`)
 }
 
 async function loadCatalog() {
@@ -189,6 +185,10 @@ async function loadCatalog() {
   problems.value = catalog.problems
   existingTests.value = catalog.existing_tests
   platemoPath.value = catalog.platemo_path
+}
+
+async function loadTasks() {
+  taskStatuses.value = await api.tasks()
 }
 
 async function refreshWorkers() {
@@ -211,6 +211,7 @@ async function refreshAll() {
   try {
     await loadCatalog()
     workers.value = await api.workers()
+    await loadTasks()
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '读取 Master 数据失败'
   } finally {
@@ -226,7 +227,7 @@ async function savePlatemoPath() {
     platemoPath.value = response.platemo_path
     showPlatemoForm.value = false
     await loadCatalog()
-    notice.value = 'PlatEMO 目录已解析。'
+    showNotice('PlatEMO 目录已解析。')
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '设置 PlatEMO 路径失败'
   } finally {
@@ -279,7 +280,7 @@ async function saveNativeSetting() {
     anchor.download = filename.toLowerCase().endsWith('.mat') ? filename : `${filename}.mat`
     anchor.click()
     URL.revokeObjectURL(url)
-    notice.value = '已导出 Master 原生设置文件。'
+    showNotice('已导出 Master 原生设置文件。')
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '保存设置失败'
   }
@@ -339,7 +340,8 @@ async function startMock() {
       retainPoints: retainPoints.value,
       workerIds: checkedWorkers.value,
     })
-    notice.value = `已创建 ${totalTasks.value} 个模拟任务。`
+    await loadTasks()
+    showNotice(`已创建 ${totalTasks.value} 个模拟任务。`)
   } catch (caught) {
     error.value = caught instanceof Error ? caught.message : '创建模拟任务失败'
   } finally {
@@ -347,8 +349,28 @@ async function startMock() {
   }
 }
 
-onMounted(refreshAll)
-onBeforeUnmount(stopResize)
+function taskParameter(task: TaskStatus, name: string) {
+  const value = task.parameters[name]
+  return value === undefined || value === '' ? '—' : String(value)
+}
+
+function taskStateLabel(task: TaskStatus) {
+  if (task.state === 'mock_queued') return '等待 Worker 领取'
+  if (task.state === 'queued') return '已入队'
+  if (task.state === 'running') return '运行中'
+  return task.state
+}
+
+onMounted(() => {
+  void refreshAll()
+  void loadTasks()
+  taskRefreshTimer = window.setInterval(() => void loadTasks(), 5000)
+})
+onBeforeUnmount(() => {
+  stopResize()
+  if (noticeTimer) window.clearTimeout(noticeTimer)
+  if (taskRefreshTimer) window.clearInterval(taskRefreshTimer)
+})
 </script>
 
 <template>
@@ -421,14 +443,19 @@ onBeforeUnmount(stopResize)
     </section>
     <div class="column-resizer" title="拖拽调整中间列宽度" @pointerdown="startColumnResize('editor', $event)"><span></span></div>
 
-    <section class="plan-panel">
+    <section class="task-panel">
       <div class="plan-toolbar"><button class="primary-button" type="button" :disabled="busy" @click="startMock">启动模拟任务</button><button class="outline-button" type="button" :disabled="busy" @click="refreshAll"><RefreshCw :size="16" /> 刷新目录</button></div>
-      <section class="plan-card"><h2>结果展示：计划分配</h2><div class="metric-grid"><div><strong>{{ totalTasks }}</strong><span>总任务</span></div><div><strong>{{ selectedAlgorithms.length }}</strong><span>算法</span></div><div><strong>{{ selectedProblems.length }}</strong><span>问题实例</span></div><div><strong>{{ selectedWorkerCount }}</strong><span>已选节点</span></div></div><p class="plan-note">{{ selectedAlgorithms.length }} 个算法 × {{ selectedProblems.length }} 个问题实例 × {{ runs }} 次运行</p></section>
-      <section class="plan-card existing-card"><h2>已有数据测试 <small>已选 {{ selectedExistingTestKeys.length }}</small></h2><div class="existing-list"><label v-for="test in existingTests" :key="existingTestKey(test)" class="existing-row" :class="{ selected: selectedExistingTestKeys.includes(existingTestKey(test)) }"><input v-model="selectedExistingTestKeys" :value="existingTestKey(test)" type="checkbox" /><span><strong>{{ test.problem }}</strong><small>{{ test.algorithm }} · M{{ test.M }} · D{{ test.D }}</small></span><b>{{ test.run_count }} 次</b><button title="按此规模加入问题实例" class="icon-button" type="button" @click.prevent="addExistingTest(test)"><Plus :size="16" /></button></label><p v-if="!existingTests.length" class="empty-text">当前 Data 目录中没有可识别的结果文件。</p></div></section>
+      <section class="plan-card"><h2>计划分配</h2><div class="metric-grid"><div><strong>{{ totalTasks }}</strong><span>总任务</span></div><div><strong>{{ selectedAlgorithms.length }}</strong><span>算法</span></div><div><strong>{{ selectedProblems.length }}</strong><span>问题</span></div><div><strong>{{ selectedWorkerCount }}</strong><span>节点</span></div></div><p class="plan-note">{{ selectedAlgorithms.length }} 个算法 × {{ selectedProblems.length }} 个问题实例 × {{ runs }} 次运行</p></section>
+      <section class="plan-card task-card"><h2>Seed 运行 <small>{{ activeTaskCount }} 个活动任务</small></h2><div class="task-list"><article v-for="task in taskStatuses" :key="task.id" class="task-row"><div class="task-title"><strong>{{ task.worker_name }}</strong><span>{{ task.problem }}</span><span>{{ task.algorithm }}</span></div><div class="task-meta">Seed {{ task.seed }} · N{{ taskParameter(task, 'N') }} · M{{ taskParameter(task, 'M') }} · D{{ taskParameter(task, 'D') }}</div><div class="task-progress"><span>{{ taskStateLabel(task) }}</span><b>FE — / —</b><div class="progress-track"><i></i></div><small>ETA 等待上报</small></div></article><p v-if="!taskStatuses.length" class="empty-text">启动任务后将在此显示每个 Seed 的分配和进度。</p></div></section>
+    </section>
+    <div class="column-resizer" title="拖拽调整运行状态列宽度" @pointerdown="startColumnResize('tasks', $event)"><span></span></div>
+
+    <section class="existing-panel">
+      <section class="plan-card existing-card"><h2>已有数据 <small>已选 {{ selectedExistingTestKeys.length }}</small></h2><div class="existing-list"><label v-for="test in existingTests" :key="existingTestKey(test)" class="existing-row" :class="{ selected: selectedExistingTestKeys.includes(existingTestKey(test)) }"><input v-model="selectedExistingTestKeys" :value="existingTestKey(test)" type="checkbox" /><span><span class="existing-title"><strong>{{ test.problem }}</strong><b>{{ test.algorithm }}</b></span><small>N— · M{{ test.M }} · D{{ test.D }}</small></span><button title="按此规模加入问题实例" class="icon-button" type="button" @click.prevent="addExistingTest(test)"><Plus :size="16" /></button></label><p v-if="!existingTests.length" class="empty-text">当前 Data 目录中没有可识别的结果文件。</p></div></section>
     </section>
   </main>
 
   <div v-if="showWorkerForm" class="modal-backdrop" @click.self="showWorkerForm = false"><form class="worker-dialog" @submit.prevent="saveWorker"><div class="dialog-heading"><h2>{{ editingWorker ? '编辑 Worker' : '添加 Worker' }}</h2><button title="关闭" class="icon-button" type="button" @click="showWorkerForm = false"><X :size="18" /></button></div><label>名称<input v-model.trim="workerForm.name" required /></label><label>地址<input v-model.trim="workerForm.url" required placeholder="http://zerotier-ip:6001" /></label><label>Token<input v-model="workerForm.token" type="password" :placeholder="editingWorker ? '留空则不修改' : '可选'" /></label><div class="dialog-actions"><button class="outline-button" type="button" @click="showWorkerForm = false">取消</button><button class="primary-button" :disabled="busy" type="submit">保存</button></div></form></div>
   <div v-if="showPlatemoForm" class="modal-backdrop" @click.self="showPlatemoForm = false"><form class="worker-dialog" @submit.prevent="savePlatemoPath"><div class="dialog-heading"><h2>PlatEMO 路径</h2><button title="关闭" class="icon-button" type="button" @click="showPlatemoForm = false"><X :size="18" /></button></div><label>根目录<input v-model.trim="platemoPath" required placeholder="例如：H:\PlatEMO" /></label><p class="dialog-note">目录必须包含 Algorithms、Problems 和 Data。</p><div class="dialog-actions"><button class="outline-button" type="button" @click="showPlatemoForm = false">取消</button><button class="primary-button" :disabled="busy" type="submit">保存并解析</button></div></form></div>
-  <div v-if="notice" class="toast notice-toast">{{ notice }}</div><div v-if="error" class="toast error-toast">{{ error }}</div>
+  <Transition name="toast"><div v-if="notice" :key="notice.id" class="toast notice-toast"><span>{{ notice.message }}</span><i class="toast-progress"></i></div></Transition><div v-if="error" class="toast error-toast">{{ error }}</div>
 </template>

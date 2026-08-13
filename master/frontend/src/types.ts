@@ -48,6 +48,20 @@ export interface Worker {
   health_error: string
 }
 
+export interface TaskStatus {
+  id: string
+  state: string
+  worker_id: string | null
+  worker_name: string
+  algorithm: string
+  problem: string
+  seed: number | string
+  parameters: Record<string, string | number | boolean | string[]>
+  created_at: string
+  updated_at: string
+  error: string
+}
+
 export interface ImportedSettings {
   format: 'platemo-setting' | 'platemo-hpc-settings'
   source: string

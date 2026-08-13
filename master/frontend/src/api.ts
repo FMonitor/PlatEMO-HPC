@@ -1,4 +1,4 @@
-import type { CatalogResponse, ImportedSettings, Worker } from './types'
+import type { CatalogResponse, ImportedSettings, TaskStatus, Worker } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init)
@@ -15,6 +15,7 @@ export const api = {
     method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ platemo_path: platemoPath }),
   }),
   workers: () => request<Worker[]>('/api/workers'),
+  tasks: () => request<TaskStatus[]>('/api/tasks'),
   previewSetting: (filename: string) => request<ImportedSettings>(`/api/settings/preview?filename=${encodeURIComponent(filename)}`),
   importSetting: (file: File) => {
     const body = new FormData()
