@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timezone
@@ -96,11 +97,33 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
     app = FastAPI(title="PlatEMO HPC Master")
     app.state.store = store
 
-    def catalog(relative: str) -> list[str]:
+    def catalog(relative: str, base_type: str) -> list[dict[str, Any]]:
         root = Path(store.setting("platemo_path")) / relative
         if not root.is_dir():
             return []
-        return sorted(path.stem for path in root.rglob("*.m") if not path.stem.startswith("@"))
+        result = []
+        class_re = re.compile(r"^\s*classdef(?:\s*\([^\n)]*\))?\s+(\w+)\s*<\s*([\w.]+)", re.I | re.M)
+        parameter_re = re.compile(r"ParameterSet\s*\((.*?)\)", re.I | re.S)
+        for path in root.rglob("*.m"):
+            if path.stem.startswith("@") or path.stem != path.name[:-2]:
+                continue
+            try:
+                source = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            match = class_re.search(source)
+            if not match or match.group(1) != path.stem or match.group(2).split(".")[-1].lower() != base_type.lower():
+                continue
+            parameters = []
+            if base_type.lower() == "algorithm":
+                call = next(iter(parameter_re.findall(source)), "")
+                pieces = [piece.strip() for piece in call.replace("...", "").split(",")]
+                for index in range(0, len(pieces) - 1, 3):
+                    name = pieces[index].strip("'\"")
+                    if re.fullmatch(r"[A-Za-z_]\w*", name):
+                        parameters.append({"name": name, "default": pieces[index + 1]})
+            result.append({"name": path.stem, "parameters": parameters})
+        return sorted(result, key=lambda item: item["name"].lower())
 
     async def probe_worker(worker: dict[str, Any]) -> dict[str, Any]:
         headers = {"X-Worker-Token": worker["token"]} if worker["token"] else {}
@@ -138,7 +161,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
         return templates.TemplateResponse(request, "index.html", {
             "workers": store.workers(), "tasks": store.tasks(), "data_dir": str(data_dir), "message": message,
             "platemo_path": store.setting("platemo_path"),
-            "algorithms": catalog("Algorithms"), "problems": catalog("Problems"),
+            "algorithms": catalog("Algorithms", "Algorithm"), "problems": catalog("Problems", "PROBLEM"),
         })
 
     @app.post("/api/settings/platemo-path")
@@ -169,6 +192,11 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
         result = await probe_worker(worker)
         return {"online": bool(result["online"]), "queue_count": result["queue_count"],
                 "last_check": result["last_check"], "error": result["health_error"]}
+
+    @app.post("/api/workers/probe-all")
+    async def probe_all() -> RedirectResponse:
+        await asyncio.gather(*(probe_worker(worker) for worker in store.workers()))
+        return RedirectResponse(url="/?message=Workers+probed", status_code=303)
 
     @app.post("/api/workers/{worker_id}/edit")
     async def edit_worker(worker_id: str, name: str = Form(...), url: str = Form(...), token: str = Form("")) -> RedirectResponse:
