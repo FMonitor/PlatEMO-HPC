@@ -94,6 +94,21 @@ def create_app(data_dir: Path) -> FastAPI:
                         (worker_id, name, url.rstrip("/"), token, now()))
         return RedirectResponse(url=f"/?message=Worker+added%3A+{worker_id}", status_code=303)
 
+    @app.post("/api/workers/{worker_id}/delete")
+    async def delete_worker(worker_id: str) -> RedirectResponse:
+        with store.connect() as con:
+            worker = con.execute("SELECT id FROM workers WHERE id = ?", (worker_id,)).fetchone()
+            if worker is None:
+                raise HTTPException(404, "Worker not found")
+            active = con.execute(
+                "SELECT COUNT(*) AS count FROM tasks WHERE worker_id = ? AND state IN ('dispatching', 'queued', 'running')",
+                (worker_id,),
+            ).fetchone()["count"]
+            if active:
+                return RedirectResponse(url="/?message=Cannot+delete+worker+with+active+tasks", status_code=303)
+            con.execute("DELETE FROM workers WHERE id = ?", (worker_id,))
+        return RedirectResponse(url="/?message=Worker+deleted", status_code=303)
+
     @app.post("/api/tasks")
     async def create_task(worker_id: str = Form(...), algorithm: str = Form(...), problem: str = Form(...),
                           seeds: str = Form("1"), pool_size: int = Form(1), settings: UploadFile | None = File(None)) -> RedirectResponse:
