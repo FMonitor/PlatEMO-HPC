@@ -206,31 +206,41 @@ def create_app(data_dir: Path) -> FastAPI:
 
     @app.post("/api/mock-runs")
     async def create_mock_run(
-        algorithm: str = Form(...),
-        problem: str = Form(...),
+        algorithms_json: str = Form(...),
+        problems_json: str = Form(...),
         runs: int = Form(30),
         pool_size: int = Form(1),
+        retain_points: int = Form(100),
         worker_ids: list[str] = Form(...),
     ) -> RedirectResponse:
         """Create local placeholder tasks to validate the assignment policy without MATLAB."""
-        if not 1 <= runs <= 1000:
+        try:
+            algorithms = json.loads(algorithms_json)
+            problems = json.loads(problems_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, "Invalid experiment list") from exc
+        if not algorithms or not problems:
+            raise HTTPException(400, "Select at least one algorithm and one problem")
+        if not 1 <= runs <= 1000 or retain_points < 1:
             raise HTTPException(400, "Runs must be between 1 and 1000")
         selected = [worker for worker in store.workers() if worker["id"] in set(worker_ids)]
         online = [worker for worker in selected if worker["online"]]
         if not online:
             raise HTTPException(400, "Select at least one online Worker")
         run_id = str(uuid.uuid4())
+        planned = [(algorithm, problem, seed) for algorithm in algorithms for problem in problems for seed in range(1, runs + 1)]
         with store.connect() as con:
-            for seed in range(1, runs + 1):
-                worker = online[(seed - 1) % len(online)]
+            for index, (algorithm, problem, seed) in enumerate(planned):
+                worker = online[index % len(online)]
                 task_id = str(uuid.uuid4())
                 payload = {
                     "id": task_id, "run_id": run_id, "mock": True, "algorithm": algorithm,
-                    "problem": problem, "seed": seed, "pool_size": pool_size, "created_at": now(),
+                    "problem": problem, "seed": seed, "pool_size": pool_size,
+                    "retain_points": retain_points, "created_at": now(),
                 }
                 con.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, '')",
                             (task_id, worker["id"], "mock_queued", json.dumps(payload), now(), now()))
-        return RedirectResponse(url=f"/?message=Mock+run+created%3A+{runs}+tasks+across+{len(online)}+workers", status_code=303)
+        return RedirectResponse(url=f"/?message=Mock+run+created%3A+{len(planned)}+tasks+across+{len(online)}+workers", status_code=303)
 
     @app.post("/api/results/{task_id}")
     async def receive_result(task_id: str, result: UploadFile = File(...), state: str = Form("completed"), error: str = Form("")) -> dict[str, str]:
