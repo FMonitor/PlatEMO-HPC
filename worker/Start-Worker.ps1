@@ -8,6 +8,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$originalLocation = Get-Location
+Set-Location -LiteralPath $scriptDir
 $python = Join-Path $scriptDir '.venv\Scripts\python.exe'
 $requirements = Join-Path $scriptDir 'requirements.txt'
 $installMarker = Join-Path $scriptDir '.venv\.requirements-installed'
@@ -28,3 +30,4 @@ if (-not $SkipInstall -and -not (Test-Path -LiteralPath $installMarker)) {
 }
 
 & $python -m app --config $ConfigPath --host $HostAddress --port $Port
+Set-Location -LiteralPath $originalLocation

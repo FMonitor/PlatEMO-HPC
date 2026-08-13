@@ -27,3 +27,5 @@ cd H:\PlatEMO\worker
 ```
 
 The Worker currently queues submitted tasks and accepts result uploads. Integrate `matlab_runner.py` with the local PlatEMO release before enabling automatic execution.
+
+`worker/config.json` 的 `data_dir` 是 Worker 本机目录，用于保存待执行任务 JSON、运行状态和临时文件；它不是 Master 的结果目录。Master 的 `--data-dir` 才是集中保存 SQLite、上传的 settings.mat 和最终结果的目录。相对路径的 Worker `data_dir` 相对于 Worker 文件夹解析。
