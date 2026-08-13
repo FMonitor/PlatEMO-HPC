@@ -7,7 +7,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [01-architecture.md](01-architecture.md) | 技术选型、总体架构、数据模型和运行状态机 |
-| [02-master.md](02-master.md) | Master 后端、Vue 管理面板、调度和 WatchDog 需求 |
+| [02-master.md](02-master.md) | Master 后端、Vue 管理面板、PlatEMO 设置和 WatchDog 需求 |
 | [03-worker.md](03-worker.md) | Worker 执行器、MATLAB 包装器、进度与恢复需求 |
 | [04-api-protocol.md](04-api-protocol.md) | REST/WebSocket 通信协议、认证、幂等和错误语义 |
 
@@ -16,6 +16,12 @@
 目标：在 ZeroTier 私有网络中可靠分配 PlatEMO 实验，实时显示任务的 FE/总 FE、ETA、日志和结果；Worker 失联后自动回收未完成任务；依据节点优先级和资源能力调度。
 
 非目标：第一阶段不实现跨机器 MATLAB `parpool`、MATLAB Parallel Server、跨节点 MPI/NCCL 训练或 Kubernetes。每个 Worker 仅使用本机 MATLAB 和本机并行池。
+
+## 设置文件兼容性
+
+- **导入**：兼容 PlatEMO `Data/Setting*.mat`。其原生变量是 `Setting={algorithms,problems,flatParameters}` 与 `Environment=[runs,retainResults]`；Master 仅解析 MAT 数据，不执行其中任何 MATLAB 代码。
+- **导出**：保存为 Master 原生 MAT，包含 `PlatEMO_HPC_FormatVersion` 和 JSON 配置。它可完整保留同一问题的多个不同参数实例，**刻意不兼容** PlatEMO GUI 的 `Setting.mat` 格式。
+- 因而“导出的 m 文件”在本文档中按设置 MAT 文件理解；本项目不会生成或执行动态 `.m` 配置脚本。
 
 ## 建议技术栈
 
@@ -36,4 +42,3 @@
 3. Vue 管理面板与 WebSocket 实时状态。
 4. WatchDog、重试、优先级和审计界面。
 5. Settings MAT 的完整导入导出和结果指标计算。
-

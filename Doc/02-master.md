@@ -5,18 +5,21 @@
 ### PlatEMO 目录与目录解析
 
 - 保存可访问的 PlatEMO 根路径，并验证包含 `Algorithms/`、`Problems/`、`Data/`。
+- Vue 顶栏提供 PlatEMO 根目录配置入口；保存后 Master 验证目录结构并重新扫描目录、预设和已有数据测试。
 - 仅纳入“文件名等于 `classdef` 类名，且继承 `ALGORITHM` 或 `PROBLEM`”的 `.m` 文件。
-- 解析类文件头部的 PlatEMO 参数元数据：`% name --- default --- description`；备用解析 `ParameterSet(...)` 和 `Setting` 中的 M/D 默认值。
+- 解析类文件头部的 PlatEMO 参数元数据：`% name --- default --- description`；无注释算法备用解析第一处 `ParameterSet(...)` 的变量名和默认值。
+- 问题参数按 PlatEMO GUI 定义为 `N`、`M`、`D`、`maxFE` 加问题类自定义参数。M/D 可以在某些实际问题中由问题类忽略或覆盖，Master 仍保留用户的配置值和原始导入值。
 - 每次目录刷新记录扫描时间、PlatEMO Git commit、可用算法/问题数量和解析异常。
-- 扫描 `Data/Settings*.mat`，提供文件列表和元信息；导入一个 MAT 时，不允许执行其中任何 MATLAB 代码。
+- 扫描 `Data/Setting*.mat`，提供文件列表和元信息；导入一个 MAT 时，不允许执行其中任何 MATLAB 代码。
+- 扫描 `Data/<Algorithm>/` 下 PlatEMO 结果命名的 MAT，聚合出可选择的已有测试 `(algorithm, problem, M, D, runs)`。
 
 ### 实验管理
 
 - 创建、复制、保存草稿、另存为、删除、启动、停止和重试实验。
 - 问题可重复加入；每个问题实例有独立参数。
 - 每次保存生成不可变的实验快照，实际任务只引用快照，不引用可变 UI 状态。
-- 导入/导出标准 `settings.mat`。导出至少包含算法实例、问题实例、运行次数、最大 Worker 数、保留点数和 UI 版本。
-- 对旧 PlatEMO Settings MAT：显示可导入字段和无法识别字段；不可静默丢弃数据。
+- 导入 PlatEMO `Setting*.mat`，并显示参数位置不足、未知类和未消费参数等诊断；不可静默丢弃数据。
+- 导出/再导入 Master 原生 `platemo-hpc-settings` MAT，包含算法实例、问题实例、运行次数、最大 Worker 数、保留点数和格式版本。该格式故意不与 PlatEMO `Setting.mat` 兼容，以支持同一问题的多参数实例。
 
 ### 任务调度与结果
 
@@ -27,7 +30,7 @@
 
 ## Vue 前端 UI
 
-采用 Vue 3 Composition API、TypeScript、Pinia 和 Router。页面组件必须避免把交互放进裸 HTML 字符串。
+采用 Vue 3 Composition API、TypeScript、Pinia 和 Router。构建产物由 FastAPI 在同源 `/` 与 `/assets` 托管；开发期使用 `master/Build-Frontend.ps1` 构建，页面组件必须避免把交互放进裸 HTML 字符串。
 
 | 页面 | 主要组件 |
 | --- | --- |
@@ -38,7 +41,7 @@
 | 设置文件 | 预设 MAT 列表、导入预览、另存为、版本历史 |
 | 审计与告警 | WatchDog 回收、任务迁移、失败原因、操作人 |
 
-工作台要求：左栏提供可搜索算法/问题；中栏支持多实例参数编辑、Settings 加载/保存与 Worker 勾选；右栏显示运行计划、预计任务数、实时事件和开始/停止按钮。
+工作台要求：左栏从上到下提供“可搜索算法、可搜索问题、执行设置、Worker 选择”；中栏支持同问题多实例参数编辑、`Setting*.mat` 加载和原生 MAT 保存；右栏显示运行计划、已有数据测试候选、预计任务数、实时事件和开始/停止按钮。已有数据测试可多选以供后续结果展示；其加号操作才会按同一 M/D 创建新的问题实例。
 
 ## 实时计算面板
 

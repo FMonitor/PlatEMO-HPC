@@ -4,4 +4,6 @@ __pycache__/
 Data/
 *.log
 .env
-
+master/frontend/node_modules/
+master/frontend/dist/
+master/frontend/*.tsbuildinfo

@@ -33,6 +33,16 @@ Experiment
 
 同一问题允许创建多个实例，例如 `SMOP1(theta=0.1, D=100)` 和 `SMOP1(theta=0.3, D=1000)` 必须是不同的 `problem_instance_id`，不能按问题名去重。
 
+## PlatEMO 设置与已有数据
+
+Master 在 PlatEMO 目录边界维护三种只读发现结果：
+
+1. 算法/问题类目录：只接受文件名与 `classdef` 类名一致，且分别继承 `ALGORITHM`、`PROBLEM` 的 `.m` 文件。
+2. `Data/Setting*.mat`：按 PlatEMO GUI 的 `Setting`/`Environment` 格式解析为可编辑实例；问题参数严格按 GUI 的 `N`、`M`、`D`、`maxFE` 再加类注释参数的顺序消费。
+3. `Data/<Algorithm>/<Algorithm>_<Problem>_M<M>_D<D>_<run>.mat`：按算法、问题、M、D 聚合为“已有数据测试”。用户选择后仅创建相同问题规模的**新问题实例**，不会篡改或覆盖既有结果。
+
+Master 原生导出的 MAT 采用 `PlatEMO_HPC_SettingsJSON`，用于再次导入本平台。它支持问题实例重复，因此不试图生成 PlatEMO 可加载的 `Setting.mat`。
+
 ## 核心实体
 
 | 实体 | 关键字段 |
@@ -79,4 +89,3 @@ stateDiagram-v2
 5. 同分时轮询，避免长期偏置。
 
 `max_workers` 约束一次 Experiment 同时可使用的不同 Worker 数；它不是 MATLAB 本地 `parpool` 大小。Worker 自己根据其 `max_local_slots` 和任务内 seed 批次决定本地并发。
-

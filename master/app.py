@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import re
 from io import BytesIO
 import sqlite3
 import uuid
@@ -14,13 +13,24 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
-from scipy.io import loadmat, savemat
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from scipy.io import loadmat
 from fastapi.templating import Jinja2Templates
 import uvicorn
 
+from platemo import (
+    discover_catalogs,
+    discover_existing_tests,
+    list_setting_files,
+    native_settings_mat,
+    parse_platemo_setting_file,
+    parse_setting_data,
+)
+
 APP_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(APP_DIR / "templates"))
+STATIC_DIR = APP_DIR / "static"
 
 
 def now() -> str:
@@ -99,44 +109,17 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
     app = FastAPI(title="PlatEMO HPC Master")
     app.state.store = store
 
-    def catalog(relative: str, base_type: str) -> list[dict[str, Any]]:
-        root = Path(store.setting("platemo_path")) / relative
-        if not root.is_dir():
-            return []
-        result = []
-        class_re = re.compile(r"^\s*classdef(?:\s*\([^\n)]*\))?\s+(\w+)\s*<\s*([\w.]+)", re.I | re.M)
-        parameter_re = re.compile(r"ParameterSet\s*\((.*?)\)", re.I | re.S)
-        metadata_re = re.compile(r"^\s*%\s*([A-Za-z_]\w*)\s+---\s+(.+?)\s+---", re.M)
-        assignment_re = re.compile(r"if\s+isempty\(obj\.(M|D)\).*?obj\.\1\s*=\s*([^;]+);", re.I | re.S)
-        for path in root.rglob("*.m"):
-            if path.stem.startswith("@") or path.stem != path.name[:-2]:
-                continue
-            try:
-                source = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            match = class_re.search(source)
-            if not match or match.group(1) != path.stem or match.group(2).split(".")[-1].lower() != base_type.lower():
-                continue
-            parameters = []
-            metadata = {name: default.strip() for name, default in metadata_re.findall(source)}
-            for name, default in metadata.items():
-                parameters.append({"name": name, "default": default})
-            for name, default in assignment_re.findall(source):
-                if not any(item["name"].lower() == name.lower() for item in parameters):
-                    parameters.append({"name": name, "default": default.strip()})
-            if not parameters:
-                call = next(iter(parameter_re.findall(source)), "")
-                pieces = [piece.strip() for piece in call.replace("...", "").split(",")]
-                parameters = [{"name": f"参数{index + 1}", "default": value} for index, value in enumerate(pieces) if value]
-            result.append({"name": path.stem, "parameters": parameters})
-        return sorted(result, key=lambda item: item["name"].lower())
-
     def settings_catalog() -> list[dict[str, str]]:
-        root = Path(store.setting("platemo_path")) / "Data"
-        if not root.is_dir():
-            return []
-        return [{"name": path.stem, "path": str(path)} for path in sorted(root.glob("Settings*.mat"))]
+        return list_setting_files(Path(store.setting("platemo_path")))
+
+    def current_catalogs() -> dict[str, list[dict[str, Any]]]:
+        root = Path(store.setting("platemo_path"))
+        return discover_catalogs(root) if root.is_dir() else {"algorithms": [], "problems": []}
+
+    def current_existing_tests() -> list[dict[str, Any]]:
+        catalogs = current_catalogs()
+        return discover_existing_tests(Path(store.setting("platemo_path")),
+                                       (item["name"] for item in catalogs["problems"]))
 
     async def probe_worker(worker: dict[str, Any]) -> dict[str, Any]:
         headers = {"X-Worker-Token": worker["token"]} if worker["token"] else {}
@@ -171,12 +154,25 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index(request: Request, message: str = "") -> HTMLResponse:
+        frontend_index = STATIC_DIR / "index.html"
+        if frontend_index.is_file():
+            return FileResponse(frontend_index)
         return templates.TemplateResponse(request, "index.html", {
             "workers": store.workers(), "tasks": store.tasks(), "data_dir": str(data_dir), "message": message,
             "platemo_path": store.setting("platemo_path"),
-            "algorithms": catalog("Algorithms", "Algorithm"), "problems": catalog("Problems", "PROBLEM"),
+            "algorithms": current_catalogs()["algorithms"], "problems": current_catalogs()["problems"],
             "settings": settings_catalog(),
         })
+
+    @app.get("/api/catalog")
+    async def api_catalog() -> dict[str, Any]:
+        catalogs = current_catalogs()
+        return {**catalogs, "settings": settings_catalog(), "existing_tests": current_existing_tests(),
+                "platemo_path": store.setting("platemo_path")}
+
+    @app.get("/api/settings/catalog")
+    async def api_settings_catalog() -> dict[str, Any]:
+        return {"settings": settings_catalog(), "existing_tests": current_existing_tests()}
 
     @app.post("/api/settings/platemo-path")
     async def set_platemo_path(platemo_path: str = Form(...)) -> RedirectResponse:
@@ -186,17 +182,46 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
         store.set_setting("platemo_path", str(path.resolve()))
         return RedirectResponse(url="/?message=PlatEMO+path+updated", status_code=303)
 
+    @app.put("/api/platemo-path")
+    async def api_set_platemo_path(payload: dict[str, str]) -> dict[str, str]:
+        """Set the configured PlatEMO root for the Vue client."""
+        path = Path(payload.get("platemo_path", "")).expanduser()
+        if not (path / "Algorithms").is_dir() or not (path / "Problems").is_dir() or not (path / "Data").is_dir():
+            raise HTTPException(422, "PlatEMO path must contain Algorithms, Problems, and Data")
+        resolved = str(path.resolve())
+        store.set_setting("platemo_path", resolved)
+        return {"platemo_path": resolved}
+
     @app.post("/api/settings/load")
     async def load_settings(settings_upload: UploadFile = File(...)) -> dict[str, Any]:
-        """Read scalar/struct values from a user-selected MATLAB settings file."""
+        """Import a PlatEMO Setting*.mat file and return an editable preview."""
         if not settings_upload.filename or not settings_upload.filename.lower().endswith(".mat"):
             raise HTTPException(400, "Select a MAT file")
         try:
             data = loadmat(BytesIO(await settings_upload.read()), simplify_cells=True)
         except Exception as exc:
             raise HTTPException(400, f"Cannot read MAT file: {exc}") from exc
-        values = {key: value for key, value in data.items() if not key.startswith("__")}
-        return {"filename": settings_upload.filename, "values": values}
+        try:
+            parsed = parse_setting_data(data, current_catalogs(), settings_upload.filename)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        return {"filename": settings_upload.filename, "values": parsed}
+
+    @app.get("/api/settings/preview")
+    async def preview_setting(filename: str) -> dict[str, Any]:
+        """Preview a bundled Data/Setting*.mat without exposing arbitrary paths."""
+        root = Path(store.setting("platemo_path")) / "Data"
+        candidate = root / Path(filename).name
+        if candidate.parent != root or not candidate.is_file() or candidate.suffix.lower() != ".mat":
+            raise HTTPException(404, "Setting file not found")
+        try:
+            return parse_platemo_setting_file(candidate, current_catalogs())
+        except (OSError, ValueError) as exc:
+            raise HTTPException(422, f"Cannot parse setting file: {exc}") from exc
+
+    @app.get("/api/existing-tests")
+    async def existing_tests() -> list[dict[str, Any]]:
+        return current_existing_tests()
 
     @app.post("/api/settings/save")
     async def save_settings(config_json: str = Form(...), filename: str = Form("PlatEMO-settings.mat")) -> StreamingResponse:
@@ -208,8 +233,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
         if not clean_name.lower().endswith(".mat"):
             clean_name += ".mat"
         output = BytesIO()
-        savemat(output, {"settings": config})
-        output.seek(0)
+        output = native_settings_mat(config)
         return StreamingResponse(output, media_type="application/octet-stream",
             headers={"Content-Disposition": f'attachment; filename="{clean_name}"'})
 
@@ -364,6 +388,9 @@ def create_app(data_dir: Path, platemo_path: Path | None = None) -> FastAPI:
                         (state, error, now(), task_id))
         return {"status": "stored", "path": str(task_dir / filename)}
 
+    # Vite emits immutable assets under /assets.  API routes are registered
+    # first so a production UI shares its origin with the Master API.
+    app.mount("/assets", StaticFiles(directory=str(STATIC_DIR / "assets"), check_dir=False), name="frontend-assets")
     return app
 
 

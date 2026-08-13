@@ -1,6 +1,6 @@
 # API 与实时通信协议
 
-版本前缀：`/api/v1`。所有时间使用 ISO-8601 UTC，所有标识符使用 UUID。Worker API 请求采用 `Authorization: Bearer <node-token>`；UI 采用用户会话或本地管理员 token。
+目标版本前缀：`/api/v1`。当前原型为兼容已有 Worker 使用 `/api/*` 路径；在任务租约 API 落地时统一迁移到 v1。所有时间使用 ISO-8601 UTC，所有标识符使用 UUID。Worker API 请求采用 `Authorization: Bearer <node-token>`；UI 采用用户会话或本地管理员 token。
 
 ## Master API
 
@@ -12,14 +12,18 @@
 | `POST` | `/tasks/{taskId}/attempts/{attemptId}/progress` | Worker | FE/ETA/日志 offset 上报 |
 | `POST` | `/tasks/{taskId}/attempts/{attemptId}/complete` | Worker | 成功、失败、取消和产物元数据 |
 | `PUT` | `/artifacts/{artifactId}` | Worker | 上传 MAT/日志，支持断点续传 |
-| `GET` | `/catalog` | UI | 算法、问题、参数、Settings 列表 |
+| `GET` | `/api/catalog` | UI | 算法、问题、参数、`Setting*.mat` 与已有测试候选 |
+| `PUT` | `/api/platemo-path` | UI | 设置并验证 PlatEMO 根目录 |
 | `POST` | `/experiments` | UI | 创建草稿/快照 |
 | `POST` | `/experiments/{id}/start` | UI | 根据快照生成 Task |
 | `POST` | `/experiments/{id}/cancel` | UI | 停止未开始任务并取消运行任务 |
 | `GET` | `/workers` | UI | Worker 状态、优先级和能力 |
 | `PATCH` | `/workers/{id}` | UI | 名称、优先级、槽位、启停状态 |
-| `POST` | `/settings/import` | UI | 上传并解析 MAT |
-| `POST` | `/settings/export` | UI | 另存为实验配置 MAT |
+| `GET` | `/api/settings/catalog` | UI | 读取预设文件和已有测试候选 |
+| `GET` | `/api/settings/preview?filename=...` | UI | 预览 PlatEMO `Data/Setting*.mat` |
+| `POST` | `/api/settings/load` | UI | 上传并解析 PlatEMO 或 Master 原生 MAT |
+| `POST` | `/api/settings/save` | UI | 另存为 Master 原生实验配置 MAT |
+| `GET` | `/api/existing-tests` | UI | 返回按算法/问题/M/D 聚合的已有结果 |
 | `GET` | `/events` | UI | 历史事件与审计 |
 
 ## Worker 领取任务
@@ -92,4 +96,3 @@ Master 拒绝过期租约、未知 Attempt 或 token 不匹配的进度。所有
 | 410 | 租约已过期 | 停止该 Attempt，保留本地产物 |
 | 422 | 任务参数不合法 | 标失败，不自动重试 |
 | 429/503 | Master 暂时不可用 | 指数退避，保持 MATLAB 不被重复启动 |
-
