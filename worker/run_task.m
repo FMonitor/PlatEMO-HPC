@@ -6,6 +6,7 @@ arguments
 end
 task = jsondecode(fileread(taskJsonPath));
 if ~isfolder(workDir), mkdir(workDir); end
+settingsBaseline = loadSettingsBaseline(task);
 if ~isfield(task, 'seeds') || isempty(task.seeds)
     error('PlatEMO:HPC:InvalidBatch', 'A batch task requires a nonempty seeds array');
 end
@@ -24,7 +25,7 @@ profile = char(getField(task, 'cluster_profile', 'local'));
 pool = gcp('nocreate');
 if ~isempty(pool), delete(pool); end
 pool = parpool(profile);
-poolCleanup = onCleanup(@() cleanupPool(pool)); %#ok<NASGU>
+poolCleanup = onCleanup(@() cleanupPool(pool));
 queue = parallel.pool.DataQueue;
 afterEach(queue, @applyUpdate);
 writeProgress('running');
@@ -36,10 +37,8 @@ for i = 1:numel(records)
     applyUpdate(records{i});
 end
 writeProgress('completed');
-snapshot = struct('task', task, 'matlab_version', version, 'cluster_profile', profile, ...
-    'pool_type', class(pool), 'pool_workers', pool.NumWorkers, 'status', 'completed', ...
-    'finished_at', char(datetime('now', 'TimeZone', 'UTC')));
-save(fullfile(workDir, 'result.mat'), 'snapshot', 'records', '-v7');
+% Each seed MAT is the durable result artifact. The Worker uploads these
+% files individually, so no aggregate result.mat is created.
 
     function applyUpdate(update)
         index = find([states.seed] == double(update.seed), 1);
@@ -60,11 +59,42 @@ save(fullfile(workDir, 'result.mat'), 'snapshot', 'records', '-v7');
         temporary = [char(progressPath) '.tmp'];
         fid = fopen(temporary, 'w');
         if fid < 0, error('PlatEMO:HPC:Progress', 'Cannot write progress.json'); end
-        cleanup = onCleanup(@() fclose(fid)); %#ok<NASGU>
+        cleanup = onCleanup(@() fclose(fid));
         fprintf(fid, '%s', jsonencode(payload));
         clear cleanup
         movefile(temporary, char(progressPath), 'f');
     end
+end
+
+function baseline = loadSettingsBaseline(task)
+% The Master has already expanded Settings into an explicit assignment. The
+% local MAT is a verified compatibility baseline, never an override for it.
+baseline = struct('applied', false, 'path', '', 'sha256', '');
+if ~isfield(task, 'settings_file_path') || isempty(task.settings_file_path), return; end
+path = char(task.settings_file_path);
+if ~isfile(path), error('PlatEMO:HPC:Settings', 'Settings MAT is unavailable: %s', path); end
+source = load(path);
+if ~isfield(source, 'Setting') || ~iscell(source.Setting) || numel(source.Setting) < 2
+    error('PlatEMO:HPC:Settings', 'Settings MAT must contain Setting{1} and Setting{2}');
+end
+algorithmNames = settingNames(source.Setting{1});
+problemNames = settingNames(source.Setting{2});
+if ~ismember(string(task.algorithm.name), algorithmNames) || ~ismember(string(task.problem.name), problemNames)
+    error('PlatEMO:HPC:Settings', 'Settings MAT does not include assigned algorithm/problem');
+end
+baseline.applied = true;
+baseline.path = path;
+if isfield(task, 'settings_sha256'), baseline.sha256 = char(task.settings_sha256); end
+end
+
+function names = settingNames(value)
+if iscell(value)
+    names = strings(1, numel(value));
+    for index = 1:numel(value), names(index) = string(value{index}); end
+else
+    names = string(value(:)');
+end
+names = erase(names, '.m');
 end
 
 function value = getField(s, name, fallback)

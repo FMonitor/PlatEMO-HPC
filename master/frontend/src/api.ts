@@ -16,6 +16,28 @@ export const api = {
   }),
   workers: () => request<Worker[]>('/api/workers'),
   tasks: () => request<TaskStatus[]>('/api/v1/ui/tasks'),
+  schedulerStatus: () => request<{ paused: boolean }>('/api/v1/scheduler/status'),
+  setSchedulerPaused: (paused: boolean) => request<{ paused: boolean }>('/api/v1/scheduler/pause', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paused }),
+  }),
+  setWorkerDispatchPaused: (workerId: string, paused: boolean) => request<{ paused: boolean }>(
+    `/api/v1/workers/${encodeURIComponent(workerId)}/dispatch-pause`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paused }),
+    },
+  ),
+  cancelAllTasks: () => request<{ status: string }>('/api/v1/seed-runs/cancel-all', { method: 'POST' }),
+  deleteSeedHistory: (pointId: string, seed: number | string) => request<{ status: string }>(
+    `/api/v1/seed-runs/${encodeURIComponent(pointId)}/${encodeURIComponent(String(seed))}/history`, { method: 'DELETE' },
+  ),
+  deleteSeedHistories: (runs: Array<{ pointId: string; seed: number | string }>) => request<{ status: string; count: number }>(
+    '/api/v1/seed-runs/history/delete', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: runs.map(({ pointId, seed }) => ({ experiment_point_id: pointId, seed: Number(seed) })) }),
+    },
+  ),
+  cancelPoint: (pointId: string) => request<{ status: string }>(`/api/v1/experiment-points/${encodeURIComponent(pointId)}/cancel`, { method: 'POST' }),
+  cancelBatch: (batchId: string) => request<{ status: string }>(`/api/v1/batch-attempts/${encodeURIComponent(batchId)}/cancel`, { method: 'POST' }),
+  cancelSeedAttempt: (attemptId: string) => request<{ status: string }>(`/api/v2/seed-attempts/${encodeURIComponent(attemptId)}/cancel`, { method: 'POST' }),
   previewSetting: (filename: string) => request<ImportedSettings>(`/api/settings/preview?filename=${encodeURIComponent(filename)}`),
   importSetting: (file: File) => {
     const body = new FormData()
@@ -54,17 +76,21 @@ export const api = {
     algorithms: object[]
     problems: object[]
     runs: number
-    maxWorkers: number | null
     retainPoints: number
-    workerIds: string[]
+    clusterProfile?: string
+    requiredPlatemoCommit?: string
+    minimumDiskFreeBytes?: number
+    settingsUpload?: File | null
   }) => {
     const body = new FormData()
     body.append('algorithms_json', JSON.stringify(payload.algorithms))
     body.append('problems_json', JSON.stringify(payload.problems))
     body.append('runs', String(payload.runs))
     body.append('retain_points', String(payload.retainPoints))
-    if (payload.maxWorkers) body.append('max_workers', String(payload.maxWorkers))
-    payload.workerIds.forEach((id) => body.append('worker_ids', id))
+    if (payload.clusterProfile) body.append('cluster_profile', payload.clusterProfile)
+    if (payload.requiredPlatemoCommit) body.append('required_platemo_commit', payload.requiredPlatemoCommit)
+    if (payload.minimumDiskFreeBytes) body.append('minimum_disk_free_bytes', String(payload.minimumDiskFreeBytes))
+    if (payload.settingsUpload) body.append('settings_upload', payload.settingsUpload)
     const response = await fetch('/api/v1/experiments', { method: 'POST', body })
     if (!response.ok) throw new Error(await response.text())
   },

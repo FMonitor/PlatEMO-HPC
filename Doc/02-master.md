@@ -19,7 +19,7 @@
 - 问题可重复加入；每个问题实例有独立参数。
 - 每次保存生成不可变的实验快照，实际任务只引用快照，不引用可变 UI 状态。
 - 导入 PlatEMO `Setting*.mat`，并显示参数位置不足、未知类和未消费参数等诊断；不可静默丢弃数据。
-- 导出/再导入 Master 原生 `platemo-hpc-settings` MAT，包含算法实例、问题实例、运行次数、最大 Worker 数、保留点数和格式版本。该格式故意不与 PlatEMO `Setting.mat` 兼容，以支持同一问题的多参数实例。
+- 导出/再导入 Master 原生 `platemo-hpc-settings` MAT，包含算法实例、问题实例、运行次数、保留点数和格式版本。该格式故意不与 PlatEMO `Setting.mat` 兼容，以支持同一问题的多参数实例。
 
 ### 任务调度与结果
 
@@ -27,7 +27,8 @@
 - 接收 `result.mat`、日志、指标 CSV；校验 SHA-256 和大小后标记完成。
 - 支持后置指标计算任务，避免 Worker 端因指标失败而丢失最终 MAT。
 - 支持取消：Master 不再分配、向运行 Worker 发取消请求、保留中间日志。
-- 当前批次调度采用 Master 分配：Master 为每个算法-问题组合创建全局 `SeedRun` 队列，不将问题绑定某个 Worker。Worker 心跳仅上报批次槽位和并行池容量；Master 在心跳响应中以事务选择兼容的待运行 Seed，签发 `batch_attempt_id + lease_token`。运行中每个 Seed 的 FE、总 FE、耗时和错误写入 `seed_runs`，批次汇总写入 `batch_attempts`，MAT/日志写入 `artifacts`。
+- 当前批次调度采用 Master 分配：Master 为每个算法-问题组合创建全局 `SeedRun` 队列，不将问题绑定某个 Worker，也不设置每实验 Worker 上限。每个新实验对所有环境兼容且未暂停接单的 Worker 可见；Worker 心跳仅上报批次槽位和并行池容量，Master 在心跳响应中以事务选择兼容的待运行 Seed，签发 `batch_attempt_id + lease_token`。运行中每个 Seed 的 FE、总 FE、耗时和错误写入 `seed_runs`，批次汇总写入 `batch_attempts`，MAT/日志写入 `artifacts`。
+- Worker 可单独暂停接单：Master 持久化该 Worker 的 `dispatch_paused` 状态，并在心跳分配事务内拒绝为其签发新批次；暂停不会取消、终止或影响该 Worker 已接受的 MATLAB 批次。恢复接单后由下一次心跳继续调度。
 - Worker 注册使用 `worker_join_token` 换取独立 `node_token`；Node Token 只用于该节点心跳、批次进度、完成与产物请求，UI 接口永不返回 Token。
 - WatchDog 每 10 秒检查心跳；连续三次 10 秒周期无有效心跳时标记 Worker 为 `suspect`，只回收其批次内 `leased/running` 的未完成 Seed，已完成 Seed 保留，二者均记录审计事件。
 
@@ -44,7 +45,7 @@
 | 设置文件 | 预设 MAT 列表、导入预览、另存为、版本历史 |
 | 审计与告警 | WatchDog 回收、任务迁移、失败原因、操作人 |
 
-工作台要求：左栏从上到下提供“可搜索算法、可搜索问题、执行设置、Worker 选择”；第二栏支持同问题多实例参数编辑、`Setting*.mat` 加载和原生 MAT 保存；第三栏显示运行计划和每个 Seed 的任务运行卡；第四栏显示已有数据测试候选。已有数据测试可多选以供后续结果展示；其加号操作才会按同一 M/D 创建新的问题实例。
+工作台要求：左栏从上到下提供“可搜索算法、可搜索问题、执行设置、Worker 管理”；Worker 管理仅展示状态、池容量与暂停接单、恢复接单、编辑、删除操作，不参与实验创建筛选。第二栏支持同问题多实例参数编辑、`Setting*.mat` 加载和原生 MAT 保存；第三栏显示运行计划和每个 Seed 的任务运行卡；第四栏显示已有数据测试候选。已有数据测试可多选以供后续结果展示；其加号操作才会按同一 M/D 创建新的问题实例。
 
 工作台布局必须支持用户临时调整：前三列的右边界均可横向拖拽，第四列自动占据余下空间并允许较窄显示；左栏可在算法、问题、执行设置之间纵向拖拽。算法和问题区域仅有最小高度，不设置最大高度；执行设置按内容自然撑开，不允许裁切输入行。布局尺寸仅保存在当前浏览器会话；中栏顶部只保留“导入”和“保存”配置操作，不显示独立的“实验预设”选择行。
 
@@ -76,4 +77,4 @@ ETA = (total_FE - FE) / rate
 - 每次探测、回收、重新分配均记录审计事件并推送 UI 告警。
 ## v1 调度实现
 
-Master 采用“Worker 主动连接、Master 主动决策”的模型：创建实验后为每个算法-问题实例创建全部 SeedRun，保存用户选中的可执行 Worker 集合。Worker 心跳报告 `available_batch_slots` 和 `max_seeds_per_batch`；Master 只在节点空闲时原子签发一个批次，并以优先级、当前占用和轮询决定下一批。10 秒一个签名心跳，连续三次缺失会回收该批次尚未完成的 Seed。接口细节和实现清单见 `Doc/07-seed-batch-scheduling.md`。
+Master 采用“Worker 主动连接、Master 主动决策”的模型：创建实验后为每个算法-问题实例创建全部 SeedRun，并向所有兼容且未暂停接单的 Worker 开放。Worker 心跳报告 `available_batch_slots` 和 `max_seeds_per_batch`；Master 只在节点空闲时原子签发一个批次，并以优先级、当前占用和轮询决定下一批。10 秒一个签名心跳，连续三次缺失会回收该批次尚未完成的 Seed。接口细节和实现清单见 `Doc/07-seed-batch-scheduling.md`。

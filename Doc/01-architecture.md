@@ -51,10 +51,10 @@ Master 原生导出的 MAT 采用 `PlatEMO_HPC_SettingsJSON`，用于再次导�
 | --- | --- |
 | `worker` | `id`、名称、ZeroTier URL、优先级、能力、状态、最后心跳、失败次数 |
 | `worker_capacity` | CPU 核数、内存、GPU、可用槽位、MATLAB 版本、PlatEMO Git commit |
-| `experiment` | 名称、Settings MAT、算法实例、问题实例、运行次数、最大 Worker 数、保留数据点数、创建人 |
+| `experiment` | 名称、Settings MAT、算法实例、问题实例、运行次数、保留数据点数、创建人 |
 | `algorithm_instance` | 算法类名、参数 JSON、排序号 |
 | `problem_instance` | 问题类名、M/D/自定义参数 JSON、排序号 |
-| `experiment_point` | 实验 ID、算法实例、问题实例、参数快照、允许 Worker 集合、状态 |
+| `experiment_point` | 实验 ID、算法实例、问题实例、参数快照、状态 |
 | `seed_run` | ExperimentPoint ID、seed、状态、当前 BatchAttempt、FE、总 FE、结果路径、租约到期时间 |
 | `batch_attempt` | ExperimentPoint ID、Worker ID、Seed 集合、开始/结束、lease token、MATLAB PID、pool 状态、错误、日志路径 |
 | `artifact` | ExperimentPoint ID、Seed、BatchAttempt ID、类型、文件名、哈希、大小、存储路径 |
@@ -83,10 +83,10 @@ stateDiagram-v2
 
 排序规则建议：
 
-1. 用户选中的 Worker 集合与 `max_workers` 限制。
+1. 实验对所有环境兼容且未暂停接单的 Worker 可见。
 2. Worker 手工优先级，数值越大越优先。
 3. 当前占用槽位/总槽位比，低者优先。
 4. 近五分钟失败率，低者优先。
 5. 同分时轮询，避免长期偏置。
 
-`max_workers` 约束一次 Experiment 同时可使用的不同 Worker 数；它不是 MATLAB 本地 `parpool` 大小。Master 依据 Worker 上报的 `max_seeds_per_batch` 签发 Seed 批次；Worker 在批内以本机 `parpool` 执行。
+实验不设 Worker 白名单或每实验 Worker 上限。Master 依据 Worker 上报的 `max_seeds_per_batch` 签发 Seed 批次；Worker 在批内以本机 `parpool` 执行。节点的人工调度仅通过“暂停接单/恢复接单”完成，暂停不影响已接受批次。

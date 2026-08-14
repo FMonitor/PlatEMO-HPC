@@ -8,6 +8,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$workerVersion = 'dynamic-seed-session-2026.08.14'
+Write-Host "[PlatEMO-HPC Worker] version=$workerVersion path=$scriptDir mode=starting" -ForegroundColor Cyan
 $originalLocation = Get-Location
 Set-Location -LiteralPath $scriptDir
 $python = Join-Path $scriptDir '.venv\Scripts\python.exe'

@@ -57,7 +57,11 @@ Master 的响应：
     "problem": {"name": "SMOP5", "parameters": {"N": 100, "M": 2, "D": 1000}},
     "seeds": [11, 12, 13, 14, 15, 16, 17, 18],
     "max_fe": 50000,
-    "retain_points": 100,
+    "N": 100,
+    "M": 2,
+    "D": 1000,
+    "problem_parameter_values": [{"value": 0.1}],
+    "retain_points": 20,
     "cluster_profile": "local"
   }
 }
@@ -67,16 +71,16 @@ Master 的响应：
 
 每个有效 progress 和运行中 heartbeat 都刷新批次的租约截止时间，并持久化 MATLAB PID、配置/实际 pool 大小和池摘要；WatchDog 只依据刷新后的截止时间判断失联。
 
-Master 只接受携带正确 `lease_token` 的 `running_batches[]` 续租。并且所有 progress、artifact、complete 写入都必须原子确认租约尚未过期；已过期的 BatchAttempt 在首个旧请求时立刻回收未完成 Seed 并返回 `410`，不能由 WatchDog 周期窗口或旧进度复活。Worker 声明零批次槽位、零配置池大小或零单批 Seed 上限时，Master 不签发 assignment。
+Master 只接受携带正确 `lease_token` 的 `running_batches[]` 续租。所有 progress、artifact、complete 的租约确认和状态写入必须在各自单个写事务内完成；已过期的 BatchAttempt 在首个旧请求时立刻回收未完成 Seed 并返回 `410`，不能由 WatchDog 周期窗口或旧进度复活。Worker 声明零批次槽位、零配置池大小或零单批 Seed 上限时，Master 不签发 assignment。即使 Worker 错报空闲，Master 也在同一签发事务内以 BatchAttempt 状态为准，拒绝向已有活跃批次（含 `cancel_requested`）的 Worker 分配第二个批次。
 
 ## Master 必须实现
 
 1. 数据模型：增加 `experiment_points`、Seed 级的 `seed_runs` 与 `batch_attempts`；移除实验创建时写入固定 `worker_id` 的逻辑。
-2. 创建实验：为每个算法-问题实例生成全部 `pending` SeedRun，并保存 UI 选择的允许 Worker 集合和 `max_workers`。
-3. 心跳调度器：根据节点在线状态、允许集合、能力兼容性、`max_workers`、优先级、占用率和轮询，选择待运行 Seed；通过心跳响应下发 `assignment`。
+2. 创建实验：为每个算法-问题实例生成全部 `pending` SeedRun；实验默认对所有兼容 Worker 可见，不保存允许 Worker 集合或每实验 Worker 上限。
+3. 心跳调度器：根据节点在线状态、暂停接单状态、能力兼容性、优先级、占用率和轮询，选择待运行 Seed；通过心跳响应下发 `assignment`。暂停接单只阻止新 assignment，不取消已有批次。
 4. 原子租约：一个 Seed 同一时间只能归属一个有效 BatchAttempt；进度、完成和产物必须校验 `batch_attempt_id + lease_token`。
 5. 状态与结果：分别持久化每个 Seed 的 FE、MaxFE、耗时、错误和结果；批次完成不覆盖已经完成的 Seed。
-6. 接收确认、取消与回收：assignment 必须在一个心跳周期内收到 `accepted` 或 `rejected`；未确认或拒绝时立即回收。取消实验点时停止新分配并通知所有相关批次；`cancel_requested` 批次的完成请求无论声称何种汇总状态，都必须将未完成 Seed 标记为 `cancelled`。失联、进程失败或租约失效时只将未完成 Seed 恢复为 `pending`，排除失联节点一段退避期。
+6. 接收确认、取消与回收：assignment 必须在一个心跳周期内收到 `accepted` 或 `rejected`；未确认或拒绝时立即回收。取消实验点时停止新分配并通知所有相关批次；`cancel_requested` 批次的完成请求无论声称何种汇总状态，都必须将未完成 Seed 标记为 `cancelled`。WatchDog 对取消确认超时或失联的 `cancel_requested` 批次执行相同的取消收敛，不得将其 Seed 恢复为 `pending`。普通失联、进程失败或租约失效才只将未完成 Seed 恢复为 `pending`，排除失联节点一段退避期。
 7. UI：任务卡按 Seed 显示实际执行节点、批次编号和进度；实验总览显示 pending、leased、running、completed、failed、cancelled 数量。
 8. 审计与测试：记录 `seed.assigned`、`seed.reclaimed`、`batch.cancelled`；覆盖并发分配、重复上报、过期租约、失联回收和三个 Worker 分担 30 Seed 的集成测试。
 
@@ -84,11 +88,11 @@ Master 只接受携带正确 `lease_token` 的 `running_batches[]` 续租。并�
 
 1. 能力探测：启动时读取 MATLAB profile 的可用 pool 上限，注册和每次心跳报告批次容量及 `max_seeds_per_batch`。
 2. 分配接收：只读取心跳响应的 `assignment`；对同一 `batch_attempt_id` 幂等，不重复启动 MATLAB。assignment 的 `cluster_profile` 必须等于 Worker 已探测的本机 profile，否则以 `profile_unavailable` 拒绝。
-3. 批次执行：为分配的 Seed 创建独立工作目录，启动一个 MATLAB 和一个指定 profile 的 `parpool`，通过 `parfor` 执行这批 Seed。
-4. 进度：逐 Seed 发送 `queued/running/completed/failed/cancelled`、FE、MaxFE、耗时和错误；启动 pool 后上报实际 pool 大小。
-5. 完成与产物：先以 `PUT /api/v1/artifacts/{artifact_id}` 上传每个已完成 Seed 的可恢复产物或批次聚合产物，再确认 BatchAttempt 完成。通信失败时保留文件，不创建第二个 MATLAB 批次。
+3. 批次执行：为分配的 Seed 创建独立工作目录，启动一个 MATLAB 和一个指定 profile 的 `parpool`，通过 `parfor` 执行这批 Seed。Master 把 `N/M/D/max_fe` 作为顶层环境字段，并把算法与问题自定义参数按目录定义顺序分别置于 `algorithm_parameter_values[].value`、`problem_parameter_values[].value`；Worker 不得按 JSON 字段顺序传递参数。
+4. 进度：逐 Seed 发送 `queued/running/completed/failed/cancelled`、FE、MaxFE、耗时和错误；启动 pool 后上报实际 pool 大小。`progress_interval_fe` 限制非终态 FE 上报间隔，终态事件不受限。
+5. 完成与产物：先以 `PUT /api/v1/artifacts/{artifact_id}` 上传每个已完成 Seed 的可恢复产物或批次聚合产物，再确认 BatchAttempt 完成。同一产物重试复用固定 artifact ID；必须持久化交付状态，只有 artifact 与 complete 都确认成功才释放本地槽位。通信失败时保留文件并继续续租，不创建第二个 MATLAB 批次。
 6. 取消与失效：收到 `cancel_batch_attempt_ids` 时终止 MATLAB 进程树，关闭 pool，并在最终 progress/complete 中将每个未终态 Seed 显式报告为 `cancelled`。进度、产物、完成任一写入返回 `410` 时终止该 MATLAB 进程树并停止该租约的一切后续写入；进程失败或租约失效只报告未完成状态和错误，由 Master 恢复为 `pending`。
-7. 重启恢复：仅重新上报可通过 PID 身份确认的 BatchAttempt；不得执行本地遗留 assignment JSON。无法确认的队列和目录保留给 Master 回收，绝不自行标记完成。
+7. 重启恢复：启动 MATLAB 后持久化 PID、命令指纹、lease 与 task 路径。仅当 `running` 文件的 batch ID、lease token、task 路径与 MATLAB `-batch` 启动表达式的 SHA-256 指纹均匹配时，重新上报存活 BatchAttempt；恢复期间继续读取 `progress.json` 并调用 progress API。收到取消或 `410` 时也必须终止该恢复 PID 的进程树。无法验证的遗留 MATLAB 必须终止进程树，工作目录保留给 Master 回收，绝不自行重新执行。完成计算而处于交付重试时报告 `phase=delivering`、PID 和 pool workers 为零。
 
 ## 验收条件
 
