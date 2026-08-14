@@ -1,6 +1,6 @@
-# Master / Worker v1 接口协议
+# Master / Worker v2 接口协议
 
-动态 Seed Session 是当前新实现：使用 `/api/v2/workers/{worker_id}/heartbeat` 逐个签发 `SeedAttempt`，允许不同实验点共享同一 MATLAB parpool 的空闲槽位。本文 `/api/v1` BatchAttempt 章节仅作为迁移兼容说明，动态实现细节以 `Doc/08-dynamic-seed-session.md` 为准。
+动态 Seed Session 是唯一 Worker 协议：使用 `/api/v2/workers/register` 和 `/api/v2/workers/{worker_id}/heartbeat` 逐个签发 `SeedAttempt`，允许不同实验点共享同一 MATLAB parpool 的空闲槽位。Worker 使用的 `/api/v1` 注册、心跳、BatchAttempt 和产物接口已退役并直接返回 `410 protocol_v1_retired`。
 
 当前版本只使用 `/api/v1` 调度协议，不保留旧的 Master 主动推送任务接口。所有标识符均为 UUID，时间使用 ISO-8601 UTC。
 
@@ -14,8 +14,8 @@ Master 启动时生成并持久化 `worker_join_token`。Worker 首次注册使�
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/workers/register` | 以 Join Token 注册并领取 Node Token |
-| `POST` | `/api/v1/workers/{worker_id}/heartbeat` | 每 10 秒上报容量与运行批次；Master 响应中下发 assignment 和取消指令 |
+| `POST` | `/api/v2/workers/register` | 以 Join Token 注册并领取 Node Token |
+| `POST` | `/api/v2/workers/{worker_id}/heartbeat` | 每 2 秒上报并行池容量与运行 Seed；Master 响应中下发 assignment 和取消指令 |
 | `POST` | `/api/v1/batch-attempts/{batch_attempt_id}/progress` | 上报批次和每个 Seed 的 FE 进度 |
 | `POST` | `/api/v1/batch-attempts/{batch_attempt_id}/complete` | 确认 completed、failed 或 cancelled |
 | `PUT` | `/api/v1/artifacts/{artifact_id}` | 上载结果 MAT 或日志产物 |

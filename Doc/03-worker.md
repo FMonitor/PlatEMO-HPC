@@ -4,7 +4,7 @@
 
 Worker 是每台计算节点的常驻 Python 服务。它只执行本机 MATLAB 和本机 `parpool`；不尝试加入跨节点 MATLAB 并行池。
 
-当前实现以 `execution_mode: dynamic_seed_session` 为新协议入口：一个 Worker 维护一个持久 MATLAB Supervisor/parpool，Pool 的每个空闲槽位可领取任意兼容实验点的单个 Seed。本文后续的 BatchAttempt 段落仅适用于迁移期间保留的旧模式；动态模式以 [08-dynamic-seed-session.md](08-dynamic-seed-session.md) 为准。
+当前 Worker 固定使用动态 Seed Session：一个 Worker 维护一个持久 MATLAB Supervisor/parpool，Pool 的每个空闲槽位可领取任意兼容实验点的单个 Seed。旧 BatchAttempt 接口仅保留给 Master 的历史数据迁移，不再作为 Worker 运行模式。
 
 ## 注册和能力声明
 

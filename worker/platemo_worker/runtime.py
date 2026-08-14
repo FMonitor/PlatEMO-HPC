@@ -103,7 +103,8 @@ class WorkerState:
             "gpu": self.config.get("gpu", []),
             "matlab_version": matlab,
             "parallel_computing_toolbox": bool(self.config.get("parallel_computing_toolbox", False)),
-            "batch_mode": True,
+            "execution_mode": "dynamic_seed_session",
+            "batch_mode": False,
             "platemo_root": str(self.root),
             "platemo_commit": self.config.get("platemo_commit", ""),
             "cluster_profile": self.config.get("cluster_profile", "local"),
@@ -940,7 +941,7 @@ class WorkerState:
             return
         payload = {"worker_id": self.worker_id, "name": self.config.get("worker_name", platform.node()), "url": self.config.get("worker_url", ""), "capabilities": self.capabilities()}
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(f"{master_url}/api/v1/workers/register", json=payload, headers={"Authorization": f"Bearer {join_token}"})
+            response = await client.post(f"{master_url}/api/v2/workers/register", json=payload, headers={"Authorization": f"Bearer {join_token}"})
             response.raise_for_status()
             self.node_token = response.json()["node_token"]
             self.save_config()

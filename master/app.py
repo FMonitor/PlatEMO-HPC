@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sys
+import time
 from io import BytesIO
 import sqlite3
 import uuid
@@ -15,7 +17,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from scipy.io import loadmat
 from fastapi.templating import Jinja2Templates
@@ -295,6 +297,19 @@ def _sha256(path: Path) -> str:
 def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str = "") -> FastAPI:
     store = Store(data_dir, platemo_path)
     app = FastAPI(title="PlatEMO HPC Master")
+
+    @app.middleware("http")
+    async def reject_legacy_worker_protocol(request: Request, call_next):
+        path = request.url.path
+        legacy_worker_paths = (
+            "/api/v1/workers/register",
+            "/api/v1/artifacts/",
+        )
+        legacy_heartbeat = path.startswith("/api/v1/workers/") and path.endswith("/heartbeat")
+        legacy_batch_delivery = path.startswith("/api/v1/batch-attempts/") and path.endswith(("/progress", "/complete"))
+        if legacy_heartbeat or legacy_batch_delivery or any(path == prefix.rstrip("/") or path.startswith(prefix) for prefix in legacy_worker_paths):
+            return JSONResponse(status_code=410, content={"detail": "protocol_v1_retired", "upgrade": "/api/v2"})
+        return await call_next(request)
     app.state.store = store
     configured_join_token = join_token or store.setting("worker_join_token")
     if not configured_join_token:
@@ -327,9 +342,18 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
     def settings_catalog() -> list[dict[str, str]]:
         return list_setting_files(Path(store.setting("platemo_path")))
 
+    catalog_cache: dict[str, Any] = {"root": "", "loaded_at": 0.0, "value": None}
+
     def current_catalogs() -> dict[str, list[dict[str, Any]]]:
         root = Path(store.setting("platemo_path"))
-        return discover_catalogs(root) if root.is_dir() else {"algorithms": [], "problems": []}
+        root_key = str(root.resolve()) if root.exists() else str(root)
+        # Heartbeats arrive every two seconds. Cache the expensive recursive
+        # MATLAB source scan so scheduling does not block the HTTP event loop.
+        if catalog_cache["value"] is None or catalog_cache["root"] != root_key or time.monotonic() - catalog_cache["loaded_at"] >= 60:
+            catalog_cache["value"] = discover_catalogs(root) if root.is_dir() else {"algorithms": [], "problems": []}
+            catalog_cache["root"] = root_key
+            catalog_cache["loaded_at"] = time.monotonic()
+        return catalog_cache["value"]
 
     def current_existing_tests() -> list[dict[str, Any]]:
         catalogs = current_catalogs()
@@ -449,6 +473,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
         if not path.is_dir():
             raise HTTPException(400, "PlatEMO path does not exist")
         store.set_setting("platemo_path", str(path.resolve()))
+        catalog_cache["value"] = None
         return RedirectResponse(url="/?message=PlatEMO+path+updated", status_code=303)
 
     @app.put("/api/platemo-path")
@@ -459,6 +484,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
             raise HTTPException(422, "PlatEMO path must contain Algorithms, Problems, and Data")
         resolved = str(path.resolve())
         store.set_setting("platemo_path", resolved)
+        catalog_cache["value"] = None
         return {"platemo_path": resolved}
 
     @app.post("/api/settings/load")
@@ -656,7 +682,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
             raise HTTPException(401, "Invalid node token")
         return worker
 
-    @app.post("/api/v1/workers/register")
+    @app.post("/api/v2/workers/register")
     async def register_worker(payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, Any]:
         if not authorization or not authorization.lower().startswith("bearer ") or authorization[7:] != app.state.worker_join_token:
             raise HTTPException(401, "Invalid worker join token")
@@ -667,7 +693,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                         "ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, node_token=excluded.node_token, capabilities_json=excluded.capabilities_json, status='online'",
                         (worker_id, str(payload.get("name") or worker_id), str(payload.get("url") or "").rstrip("/"), "", node_token, now(), json.dumps(payload.get("capabilities", {})), "online", int(payload.get("priority", 0))))
         store.event("worker.registered", None, None, {"worker_id": worker_id, "name": payload.get("name", worker_id)})
-        return {"worker_id": worker_id, "node_token": node_token, "heartbeat_seconds": 10}
+        return {"worker_id": worker_id, "node_token": node_token, "heartbeat_seconds": 2, "protocol": "v2"}
 
     def assign_batch(worker_id: str, capacity: dict[str, Any]) -> dict[str, Any] | None:
         """Atomically choose pending seeds and issue one BatchAttempt for a heartbeat."""
@@ -881,7 +907,16 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                 "SELECT id FROM seed_attempts_v3 WHERE worker_id=? AND state='cancel_requested'",
                 (worker_id,),
             )]
-            while free_slots > len(assignments) and actual > 0:
+            # The Worker-reported free slots are advisory. Bound dispatch by
+            # the Master lease table as well, so stale attempts from a
+            # delivery/restart race can never overbook the MATLAB pool.
+            active_count = con.execute(
+                "SELECT COUNT(*) FROM seed_attempts_v3 "
+                "WHERE worker_id=? AND state IN ('assigned','running','cancel_requested')",
+                (worker_id,),
+            ).fetchone()[0]
+            effective_free_slots = min(free_slots, max(0, actual - int(active_count)))
+            while effective_free_slots > len(assignments) and actual > 0:
                 assignment = dynamic_seed_assignment(con, worker_id, session_id, capabilities)
                 if assignment is None:
                     break
@@ -1517,9 +1552,23 @@ def main() -> None:
     # Chromium blocks port 6000 as unsafe, so use a nearby browser-safe default.
     parser.add_argument("--port", type=int, default=6080)
     args = parser.parse_args()
+    if sys.platform == "win32":
+        # Python 3.14's Proactor loop can race with Uvicorn while closing
+        # sockets, leaving Ctrl+C stuck in _start_serving. Master has no
+        # subprocess requirement, so the selector loop is the safer server
+        # backend on Windows.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     application = create_app(args.data_dir.resolve(), args.platemo_path, args.worker_join_token)
     print(f"Worker Join Token: {application.state.worker_join_token}", flush=True)
-    uvicorn.run(application, host=args.host, port=args.port)
+    uvicorn.run(
+        application,
+        host=args.host,
+        port=args.port,
+        loop="asyncio",
+        http="h11",
+        workers=1,
+        timeout_graceful_shutdown=5,
+    )
 
 
 if __name__ == "__main__":

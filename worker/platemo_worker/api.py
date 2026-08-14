@@ -15,7 +15,8 @@ from .dynamic_session import DynamicSession
 def create_app(config_path: Path) -> FastAPI:
     config = json.loads(config_path.read_text(encoding="utf-8"))
     state = WorkerState(config, config_path)
-    dynamic = DynamicSession(state) if config.get("execution_mode") == "dynamic_seed_session" else None
+    # Worker protocol is permanently dynamic; there is no legacy mode switch.
+    dynamic = DynamicSession(state)
     state.save_config()
     app = FastAPI(title="PlatEMO HPC Worker")
     app.state.worker = state
@@ -34,9 +35,7 @@ def create_app(config_path: Path) -> FastAPI:
             app.state.control_task = asyncio.create_task(dynamic.run())
             app.state.dynamic_session = dynamic
             return
-        await state.recover_running_processes()
-        await state.resume_deliveries()
-        app.state.control_task = asyncio.create_task(state.control_loop())
+        app.state.control_task = asyncio.create_task(dynamic.run())
 
     @app.on_event("shutdown")
     async def stop_runtime() -> None:
@@ -57,7 +56,7 @@ def create_app(config_path: Path) -> FastAPI:
         verify(x_worker_token, authorization)
         if dynamic is not None:
             return {"status": "ready" if dynamic.actual_workers else "starting", "worker_id": state.worker_id,
-                    "queued": len(dynamic.inbox.glob("*.json")), "running": len(dynamic.running),
+                    "queued": sum(1 for _ in dynamic.inbox.glob("*.json")), "running": len(dynamic.running),
                     "available_batch_slots": dynamic._free_slots(),
                     "configured_pool_workers": state.configured_pool_workers,
                     "actual_pool_workers": dynamic.actual_workers,

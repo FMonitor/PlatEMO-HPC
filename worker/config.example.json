@@ -5,7 +5,6 @@
   "cluster_profile": "local",
   "profile_probe_timeout_seconds": 300,
   "max_seeds_per_batch": 0,
-  "execution_mode": "dynamic_seed_session",
   "worker_name": "worker-01",
   "worker_url": "http://WORKER_ZEROTIER_IP:6001",
   "master_join_token": "copy-the-token-from-master-settings-or-startup",

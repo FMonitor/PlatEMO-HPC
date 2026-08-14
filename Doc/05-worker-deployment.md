@@ -43,13 +43,13 @@ Worker 配置必须包含：
 - `node_token`：首次注册成功后由 Worker 自动保存；不要手工复制到其他节点。
 - `auto_run`：生产节点应为 `true`；设为 `false` 时节点只注册和心跳，不领取或执行任务，适合维护窗口。
 
-注册成功后，旧 Batch 模式每 10 秒向 `/api/v1/workers/{worker_id}/heartbeat` 上报。新安装默认使用 `execution_mode: "dynamic_seed_session"`：Worker 每 2 秒向 `/api/v2/workers/{worker_id}/heartbeat` 上报持久 MATLAB Supervisor 的实际 pool 大小、空闲 Seed 槽位与运行 Seed 摘要；Master 只为空闲槽位签发单个 Seed。不同实验点可共同填满同一个本机 `parpool`，Worker 不自行挑选任务。
+Worker 固定使用动态 Seed Session：每 2 秒向 `/api/v2/workers/{worker_id}/heartbeat` 上报持久 MATLAB Supervisor 的实际 pool 大小、空闲 Seed 槽位与运行 Seed 摘要；Master 只为空闲槽位签发单个 Seed。不同实验点可共同填满同一个本机 `parpool`，Worker 不自行挑选任务。
 
 ## 动态会话部署
 
 1. 关闭该节点的 `Start-Worker.ps1` 服务；不要用任务管理器结束其它人工启动的 MATLAB。
 2. 覆盖 Worker 程序文件与 `platemo_worker/`，保留 `config.json`、`Data/` 和 `.venv/`。
-3. 在 `config.json` 设置 `"execution_mode": "dynamic_seed_session"`。不需要设置 `max_seeds_per_batch`；动态模式以 MATLAB profile 实际创建的 pool worker 数为准。
+3. 不需要设置运行模式或 `max_seeds_per_batch`；Worker 以 MATLAB profile 实际创建的 pool worker 数为准。
 4. 先启动 Master，再启动 `Start-Worker.ps1`。Worker 会先探测 profile，随后启动一个无头 MATLAB Supervisor 和一个持久 `parpool`。全局或节点“暂停接单”只阻止新 Seed，不会阻止 Supervisor 建池。
 5. 首次发布先保持调度暂停，确认前端显示 `池 0/N` 到 `池 N/N` 的变化及 Worker 日志中的 `dynamic MATLAB session started`。恢复分配后用一个小规模实验验证 MAT 上传。
 

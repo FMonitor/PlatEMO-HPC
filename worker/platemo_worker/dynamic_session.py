@@ -137,6 +137,9 @@ class DynamicSession:
         while True:
             self.state.schedule_pool_capacity_probe()
             try:
+                # Dynamic mode still uses the common join-token registration
+                # path when a node token has not been persisted yet.
+                await self.state.register_with_master()
                 await self.start()
             except OSError as exc:
                 self.log.error("unable to start dynamic MATLAB session: %s", exc)
@@ -168,6 +171,11 @@ class DynamicSession:
                 await self._cancel(str(attempt_id))
             for assignment in response.json().get("assignments", []):
                 await self._accept(dict(assignment))
+        except httpx.HTTPStatusError as exc:
+            self.state.set_master_connection(False, f"HTTP {exc.response.status_code}")
+            if exc.response.status_code == 401:
+                self.state.node_token = ""
+                self.state.save_config()
         except httpx.HTTPError as exc:
             self.state.set_master_connection(False, str(exc))
 

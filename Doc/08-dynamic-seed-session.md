@@ -59,7 +59,7 @@ MATLAB Supervisor 或 Worker 重启时：先验证 PID 与 session 记录；不�
 ## 迁移顺序
 
 1. 增加 v2 Session/SeedAttempt 表和端点，不修改现有 v1 Batch 路径。
-2. Worker 增加 Supervisor 模式，受 `execution_mode: dynamic_seed_session` 显式启用。
+2. Worker 固定使用 Supervisor 模式，不再通过配置项切换旧 Batch 模式。
 3. 前端显示“实际池/配置池”“运行 Seed/空闲槽位”和 Session 状态。
 4. 在单 Worker、40 槽位、每点 30 Seed 的场景验证跨实验点补位、逐 Seed 上传、网络断连恢复和取消。
 5. 验收后将默认执行模式切为动态会话；历史 BatchAttempt 保持只读直至清理窗口结束。

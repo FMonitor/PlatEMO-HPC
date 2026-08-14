@@ -486,6 +486,7 @@ function workerPoolUsage(worker: Worker) {
 
 function workerStatus(worker: Worker) {
   if (!worker.online || worker.status === 'suspect') return { label: worker.status === 'suspect' ? '心跳失联' : '离线', tone: 'offline', detail: '等待 Worker 恢复心跳' }
+  if (Number(worker.dispatch_paused ?? 0) > 0) return { label: '暂停接单', tone: 'paused', detail: '' }
   const batch = worker.active_batch
   const session = worker.dynamic_session
   if (session && session.actual_workers > 0) {
