@@ -29,7 +29,8 @@ try
     record.state = 'completed';
     record.fe = task.max_fe;
     record.elapsed_seconds = toc(started);
-    save(fullfile(task.runs_dir, sprintf('seed-%d.mat', seed)), 'seed', 'record', '-append');
+    % Successful artifacts are written by reportProgress in native PlatEMO
+    % result/metric format. Lifecycle metadata is sent through the queue.
 catch ME
     record.state = 'failed';
     record.elapsed_seconds = toc(started);
@@ -48,10 +49,9 @@ send(queue, record);
         end
         lastReportedFE = Problem.FE;
         if Problem.FE >= Problem.maxFE
-            result = Algorithm.result;
-            metric = Algorithm.metric;
-            save(fullfile(task.runs_dir, sprintf('seed-%d.mat', seed)), ...
-                'seed', 'result', 'metric', 'record', 'task_snapshot', 'matlab_version', '-v7.3');
+            result = Algorithm.result; %#ok<NASGU>
+            metric = Algorithm.metric; %#ok<NASGU>
+            save(fullfile(task.runs_dir, sprintf('seed-%d.mat', seed)), 'result', 'metric', '-v7');
         end
         send(queue, record);
     end

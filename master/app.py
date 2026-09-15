@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from scipy.io import loadmat
 from fastapi.templating import Jinja2Templates
@@ -693,7 +693,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                         "ON CONFLICT(id) DO UPDATE SET name=excluded.name, url=excluded.url, node_token=excluded.node_token, capabilities_json=excluded.capabilities_json, status='online'",
                         (worker_id, str(payload.get("name") or worker_id), str(payload.get("url") or "").rstrip("/"), "", node_token, now(), json.dumps(payload.get("capabilities", {})), "online", int(payload.get("priority", 0))))
         store.event("worker.registered", None, None, {"worker_id": worker_id, "name": payload.get("name", worker_id)})
-        return {"worker_id": worker_id, "node_token": node_token, "heartbeat_seconds": 2, "protocol": "v2"}
+        return {"worker_id": worker_id, "node_token": node_token}
 
     def assign_batch(worker_id: str, capacity: dict[str, Any]) -> dict[str, Any] | None:
         """Atomically choose pending seeds and issue one BatchAttempt for a heartbeat."""
@@ -856,7 +856,9 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                 (attempt_id, assigned_at, point["id"], seed_row["seed"]),
             )
             return {"attempt_id": attempt_id, "lease_token": token, "experiment_point_id": point["id"],
-                    "seed": seed_row["seed"], "algorithm": algorithm, "problem": problem,
+                    "seed": seed_row["seed"],
+                    "algorithm": {"name": str(algorithm.get("name", ""))},
+                    "problem": {"name": str(problem.get("name", ""))},
                     "max_fe": int(params.get("maxFE", params.get("max_fe", 50000)) or 50000),
                     "retain_points": int(config.get("retain_points", 20)),
                     "progress_interval_fe": max(1, int(params.get("maxFE", params.get("max_fe", 50000)) or 50000) // 100),
@@ -922,8 +924,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                     break
                 assignments.append(assignment)
             con.execute("COMMIT")
-        return {"status": "ok", "server_time": now(), "assignments": assignments,
-                "cancel_attempt_ids": cancellations}
+        return {"assignments": assignments, "cancel_attempt_ids": cancellations}
 
     def active_seed_attempt(con: sqlite3.Connection, attempt_id: str, token: str,
                             authorization: str | None) -> sqlite3.Row:
@@ -949,7 +950,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
             con.execute("UPDATE seed_runs_v2 SET state=?,fe=?,total_fe=?,elapsed_seconds=?,error=?,updated_at=? WHERE experiment_point_id=? AND seed=? AND batch_attempt_id=?",
                         (state, int(payload.get("fe", 0)), int(payload.get("total_fe", attempt["total_fe"])), float(payload.get("elapsed_seconds", 0)), str(payload.get("error", "")), now(), attempt["experiment_point_id"], attempt["seed"], attempt_id))
             con.execute("COMMIT")
-        return {"status": "accepted"}
+        return Response(status_code=204)
 
     @app.post("/api/v2/seed-attempts/{attempt_id}/reject")
     async def dynamic_seed_reject(attempt_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, str]:
@@ -962,7 +963,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                         "WHERE experiment_point_id=? AND seed=? AND batch_attempt_id=?",
                         (reason, now(), attempt["experiment_point_id"], attempt["seed"], attempt_id))
             con.execute("COMMIT")
-        return {"status": "accepted"}
+        return Response(status_code=204)
 
     @app.post("/api/v2/seed-attempts/{attempt_id}/cancel")
     async def cancel_dynamic_seed(attempt_id: str) -> dict[str, str]:
@@ -980,7 +981,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                         ("cancel requested by user", now(), attempt["experiment_point_id"], attempt["seed"], attempt_id))
             con.execute("COMMIT")
         store.record_v2_event("seed.cancel_requested", attempt["experiment_point_id"], attempt_id, {})
-        return {"status": "accepted"}
+        return Response(status_code=204)
 
     @app.put("/api/v2/artifacts/{artifact_id}")
     async def dynamic_seed_artifact(artifact_id: str, attempt_id: str = Form(...), lease_token: str = Form(...), artifact: UploadFile = File(...), authorization: str | None = Header(None)) -> dict[str, Any]:
@@ -1010,7 +1011,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                 con.execute("COMMIT")
         finally:
             temporary.unlink(missing_ok=True)
-        return {"status": "stored", "artifact_id": artifact_id, "sha256": digest, "size": len(content)}
+        return Response(status_code=204)
 
     @app.post("/api/v2/seed-attempts/{attempt_id}/complete")
     async def dynamic_seed_complete(attempt_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, str]:
@@ -1034,7 +1035,7 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                 con.execute("UPDATE experiment_points SET state='completed',updated_at=? "
                             "WHERE id=? AND state!='cancelled'", (now(), attempt["experiment_point_id"]))
             con.execute("COMMIT")
-        return {"status": "accepted"}
+        return Response(status_code=204)
 
     @app.post("/api/v1/workers/{worker_id}/heartbeat")
     async def worker_heartbeat(worker_id: str, payload: dict[str, Any], authorization: str | None = Header(None)) -> dict[str, Any]:
@@ -1211,7 +1212,10 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
                 return {"status": "reclaimed"}
             apply_progress_in_transaction(con, batch, batch_id, payload)
             con.execute("COMMIT")
-        store.record_v2_event("batch.progress", batch["experiment_point_id"], batch_id, {"phase": phase})
+        # Progress is already persisted in seed_attempts_v3/seed_runs_v2 and
+        # is polled by the UI. Do not duplicate every heartbeat-sized update
+        # in the append-only events table; lifecycle transitions below remain
+        # auditable there.
         return {"status": "accepted"}
 
     @app.post("/api/v1/batch-attempts/{batch_id}/complete")
@@ -1536,6 +1540,50 @@ def create_app(data_dir: Path, platemo_path: Path | None = None, join_token: str
             con.execute("COMMIT")
         store.record_v2_event("seed.history_batch_deleted", None, None, {"count": len(selected)})
         return {"status": "deleted", "count": len(selected)}
+
+    @app.post("/api/v1/seed-runs/history/retry")
+    async def retry_seed_histories(payload: dict[str, Any]) -> dict[str, int | str]:
+        """Requeue selected failed SeedRun records without deleting their audit history."""
+        raw_runs = payload.get("runs")
+        if not isinstance(raw_runs, list) or not raw_runs:
+            raise HTTPException(422, "runs must be a non-empty list")
+        if len(raw_runs) > 1000:
+            raise HTTPException(422, "at most 1000 history records can be retried at once")
+        selected: list[tuple[str, int]] = []
+        seen: set[tuple[str, int]] = set()
+        for raw_run in raw_runs:
+            if not isinstance(raw_run, dict):
+                raise HTTPException(422, "each run must be an object")
+            point_id, seed = raw_run.get("experiment_point_id"), raw_run.get("seed")
+            if not isinstance(point_id, str) or not point_id.strip():
+                raise HTTPException(422, "experiment_point_id must be a non-empty string")
+            if isinstance(seed, bool) or not isinstance(seed, int):
+                raise HTTPException(422, "seed must be an integer")
+            if (point_id, seed) not in seen:
+                seen.add((point_id, seed))
+                selected.append((point_id, seed))
+        timestamp = now()
+        with store.connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            for point_id, seed in selected:
+                row = con.execute("SELECT state FROM seed_runs_v2 WHERE experiment_point_id=? AND seed=?", (point_id, seed)).fetchone()
+                if row is None:
+                    con.execute("ROLLBACK")
+                    raise HTTPException(404, "Seed history not found")
+                if row["state"] != "failed":
+                    con.execute("ROLLBACK")
+                    raise HTTPException(409, "Only failed history can be retried")
+            con.executemany(
+                "UPDATE seed_runs_v2 SET state='pending', batch_attempt_id=NULL, error='', updated_at=? WHERE experiment_point_id=? AND seed=?",
+                [(timestamp, point_id, seed) for point_id, seed in selected],
+            )
+            con.executemany(
+                "UPDATE experiment_points SET state='pending', updated_at=? WHERE id=? AND state NOT IN ('cancelled','completed')",
+                [(timestamp, point_id) for point_id, _ in selected],
+            )
+            con.execute("COMMIT")
+        store.record_v2_event("seed.history_batch_retried", None, None, {"count": len(selected)})
+        return {"status": "accepted", "count": len(selected)}
 
     # Vite emits immutable assets under /assets.  API routes are registered
     # first so a production UI shares its origin with the Master API.

@@ -1,13 +1,23 @@
-# 批次进程控制约定
+# Seed 进程控制与取消
 
-一个 Worker 只启动一个 MATLAB 批次进程。该进程按任务的 `cluster_profile` 创建 MATLAB `parpool`，并使用 `parfor` 执行多个 seed。
+## 控制边界
 
-停止操作只针对批次：Master 取消实验点或 BatchAttempt 后，在 Worker 心跳响应中下发取消指令，终止 MATLAB 进程树并关闭该批次的并行池。不能单独终止 pool worker，也不要求 Seed 级强制停止。
+一个 Seed 对应一个 MATLAB `parfeval` Future。取消只针对该 Future，不关闭整个 MATLAB Supervisor，也不影响同池其他 Seed。
 
-每个 seed 有独立结果文件和进度记录。`progress.json` 至少包含 `completed_runs`、`running_runs`、`failed_runs`、`total_runs`、`pool`，以及 `runs[]` 中每个 seed 的 `seed/state/fe/total_fe/elapsed_seconds/error`。
+## 取消流程
 
-Worker 运行时将 `progress.json` 内容 POST 到 BatchAttempt 的 `progress` 接口；进程结束后调用 `complete`。Master 的 WatchDog 以心跳与批次租约判断失联，超过三次心跳未到达则回收该 BatchAttempt 中未完成的 Seed，并将它们重新排队给其他兼容 Worker。
+1. 用户调用 `/api/v2/seed-attempts/{attempt_id}/cancel`。
+2. Master 在下一次 Worker 心跳响应中返回 `cancel_attempt_ids`。
+3. Worker 写入对应的本地取消标记。
+4. MATLAB Supervisor 只取消对应 Future，并写入 `cancelled` 终态事件。
+5. Master 将该 Seed 标记为 cancelled，不再重新入队。
 
-## 调度边界
+如果任务已经进入交付阶段，Worker 不再中断上传；Master 根据取消竞态决定最终是否保留已完成结果。
 
-Master 回收的是 BatchAttempt 中未完成的 Seed，而不是已完成的 Seed。新的 BatchAttempt 使用新的租约，旧 Worker 继续上报时会收到 `410`。因此 Worker 必须终止失效批次并保留本地文件；不能让两个 Worker 同时持有同一个 Seed 的有效租约。
+## 租约失效
+
+进度、产物或完成请求收到 410 后，Worker 必须停止该 Seed 的后续写入。动态 Supervisor 仍可继续运行其他 Future；失效 Seed 的本地 MAT、JSON 和日志保留以便审计。
+
+## 重启安全
+
+Worker 持久化 Supervisor PID、启动表达式指纹和会话目录。重启时只对能验证为本 Worker 的 MATLAB 进程继续管理；无法验证的进程树必须终止。Worker 不会仅凭旧 inbox JSON 重新启动已经失去租约的 Seed。

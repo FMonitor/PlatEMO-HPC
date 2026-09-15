@@ -1,103 +1,40 @@
-# 多 Worker Seed 批次调度对接方案
+# 多 Worker Seed 调度
 
-## 已确认约定
+## 当前约定
 
-- 一个实验点是一个算法实例加一个问题实例及其不可变参数快照。
-- 同一实验点的全部 Seed 由 Master 全局管理，不绑定到某个 Worker。
-- 一个 Worker 同时仅运行一个 MATLAB 批次进程和一个本地 `parpool`。
-- 一个批次只能包含同一实验点的多个 Seed；不同 Worker 可以同时执行同一实验点的不同 Seed 批次。
-- Worker 主动连接 Master；Master 决定 Seed 分配。Master 不向 Worker 的 URL 主动推送任务。
-- 取消粒度是 BatchAttempt；已完成 Seed 保留，未完成 Seed 可以回收和重新分配。
+当前运行模式是 Seed 级动态调度：所有算法-问题组合的 Seed 进入全局队列，哪个 Worker 有空闲并行池槽位，哪个 Worker 就在心跳中获得新的 Seed。
 
-## 分配流程
+## 分配规则
 
-```mermaid
-sequenceDiagram
-  participant W as Worker
-  participant M as Master
-  participant DB as Scheduler DB
-  W->>M: heartbeat(capacity, running batches)
-  M->>DB: 原子选择兼容的 pending Seed
-  DB-->>M: Seed 11..18 + BatchAttempt + lease token
-  M-->>W: assignment 或空分配 + cancel 指令
-  W->>W: MATLAB -batch + parpool + parfor(Seed 11..18)
-  W->>M: per-seed progress / artifact / complete
-  M->>DB: 持久化 Seed 状态和审计事件
-```
+- Master 不把问题绑定到某个 Worker；
+- Worker 的可见性由环境约束、Profile、PlatEMO 版本、磁盘下限和节点暂停状态决定；
+- `free_seed_slots` 是当前可提交的独立 Seed 数；
+- 一个 Worker 可以同时运行不超过实际 `parpool` worker 数的 Seed；
+- 一个 Seed 完成后立即释放 MATLAB 槽位，交付通过独立上传队列执行；
+- 交付期间不占用计算槽位，但仍占用租约直到 complete 确认；
+- `max_workers` 不再作为用户级任务绑定配置，调度容量以心跳中的实际空闲槽位为准。
 
-Master 为一个实验点创建 30 个 Seed 时，Worker A、B、C 分别报告批次上限为 10、8、6，Master 可以签发 `[1..10]`、`[11..18]`、`[19..24]`。任一 Worker 完成后再领取剩余 `[25..30]`。分配数量为 `min(max_seeds_per_batch, 该实验点剩余 pending Seed)`；不能把运行中的 Seed 再次分给其他 Worker。
+## 心跳响应
 
-## Worker 心跳和响应
-
-请求必须至少包含：
+Worker V2 心跳请求包含：
 
 ```json
 {
-  "available_batch_slots": 1,
-  "max_concurrent_batches": 1,
-  "configured_pool_workers": 10,
-  "actual_pool_workers": 0,
-  "max_seeds_per_batch": 10,
-  "running_batches": []
+  "session_id": "uuid",
+  "pool": {"state": "ready", "configured_workers": 40, "actual_workers": 40},
+  "free_seed_slots": 12,
+  "running_seeds": []
 }
 ```
 
-运行中的批次将 `available_batch_slots` 报为 `0`，并上报 `batch_attempt_id`、`lease_token`、MATLAB PID、实际 pool 大小与每个 Seed 的进度。`configured_pool_workers` 由 MATLAB cluster profile 决定，Worker 不以配置文件覆盖它；`max_seeds_per_batch` 可以小于 pool 大小，用于限制单批运行时间。若 profile 探测失败或得到零 workers，Worker 必须报告零可用容量且拒绝 assignment。
-
-Master 的响应：
-
-```json
-{
-  "cancel_batch_attempt_ids": [],
-  "assignment": {
-    "batch_attempt_id": "uuid",
-    "lease_token": "opaque-secret",
-    "experiment_point_id": "uuid",
-    "algorithm": {"name": "RVEA", "parameters": {}},
-    "problem": {"name": "SMOP5", "parameters": {"N": 100, "M": 2, "D": 1000}},
-    "seeds": [11, 12, 13, 14, 15, 16, 17, 18],
-    "max_fe": 50000,
-    "N": 100,
-    "M": 2,
-    "D": 1000,
-    "problem_parameter_values": [{"value": 0.1}],
-    "retain_points": 20,
-    "cluster_profile": "local"
-  }
-}
-```
-
-无分配时 `assignment` 为 `null`。Master 必须在同一数据库事务内锁定 Seed、创建 BatchAttempt、生成 lease token，避免两台 Worker 获得相同 Seed。Worker 必须在一个心跳周期内以首个 `progress(phase=accepted/running)` 确认 assignment，或报告 `rejected` 和稳定错误码；未确认或拒绝时 Master 立即使该 BatchAttempt 失效并将全部未完成 Seed 恢复为 `pending`，不得等待长租约超时。
-
-每个有效 progress 和运行中 heartbeat 都刷新批次的租约截止时间，并持久化 MATLAB PID、配置/实际 pool 大小和池摘要；WatchDog 只依据刷新后的截止时间判断失联。
-
-Master 只接受携带正确 `lease_token` 的 `running_batches[]` 续租。所有 progress、artifact、complete 的租约确认和状态写入必须在各自单个写事务内完成；已过期的 BatchAttempt 在首个旧请求时立刻回收未完成 Seed 并返回 `410`，不能由 WatchDog 周期窗口或旧进度复活。Worker 声明零批次槽位、零配置池大小或零单批 Seed 上限时，Master 不签发 assignment。即使 Worker 错报空闲，Master 也在同一签发事务内以 BatchAttempt 状态为准，拒绝向已有活跃批次（含 `cancel_requested`）的 Worker 分配第二个批次。
-
-## Master 必须实现
-
-1. 数据模型：增加 `experiment_points`、Seed 级的 `seed_runs` 与 `batch_attempts`；移除实验创建时写入固定 `worker_id` 的逻辑。
-2. 创建实验：为每个算法-问题实例生成全部 `pending` SeedRun；实验默认对所有兼容 Worker 可见，不保存允许 Worker 集合或每实验 Worker 上限。
-3. 心跳调度器：根据节点在线状态、暂停接单状态、能力兼容性、优先级、占用率和轮询，选择待运行 Seed；通过心跳响应下发 `assignment`。暂停接单只阻止新 assignment，不取消已有批次。
-4. 原子租约：一个 Seed 同一时间只能归属一个有效 BatchAttempt；进度、完成和产物必须校验 `batch_attempt_id + lease_token`。
-5. 状态与结果：分别持久化每个 Seed 的 FE、MaxFE、耗时、错误和结果；批次完成不覆盖已经完成的 Seed。
-6. 接收确认、取消与回收：assignment 必须在一个心跳周期内收到 `accepted` 或 `rejected`；未确认或拒绝时立即回收。取消实验点时停止新分配并通知所有相关批次；`cancel_requested` 批次的完成请求无论声称何种汇总状态，都必须将未完成 Seed 标记为 `cancelled`。WatchDog 对取消确认超时或失联的 `cancel_requested` 批次执行相同的取消收敛，不得将其 Seed 恢复为 `pending`。普通失联、进程失败或租约失效才只将未完成 Seed 恢复为 `pending`，排除失联节点一段退避期。
-7. UI：任务卡按 Seed 显示实际执行节点、批次编号和进度；实验总览显示 pending、leased、running、completed、failed、cancelled 数量。
-8. 审计与测试：记录 `seed.assigned`、`seed.reclaimed`、`batch.cancelled`；覆盖并发分配、重复上报、过期租约、失联回收和三个 Worker 分担 30 Seed 的集成测试。
-
-## Worker 必须实现
-
-1. 能力探测：启动时读取 MATLAB profile 的可用 pool 上限，注册和每次心跳报告批次容量及 `max_seeds_per_batch`。
-2. 分配接收：只读取心跳响应的 `assignment`；对同一 `batch_attempt_id` 幂等，不重复启动 MATLAB。assignment 的 `cluster_profile` 必须等于 Worker 已探测的本机 profile，否则以 `profile_unavailable` 拒绝。
-3. 批次执行：为分配的 Seed 创建独立工作目录，启动一个 MATLAB 和一个指定 profile 的 `parpool`，通过 `parfor` 执行这批 Seed。Master 把 `N/M/D/max_fe` 作为顶层环境字段，并把算法与问题自定义参数按目录定义顺序分别置于 `algorithm_parameter_values[].value`、`problem_parameter_values[].value`；Worker 不得按 JSON 字段顺序传递参数。
-4. 进度：逐 Seed 发送 `queued/running/completed/failed/cancelled`、FE、MaxFE、耗时和错误；启动 pool 后上报实际 pool 大小。`progress_interval_fe` 限制非终态 FE 上报间隔，终态事件不受限。
-5. 完成与产物：先以 `PUT /api/v1/artifacts/{artifact_id}` 上传每个已完成 Seed 的可恢复产物或批次聚合产物，再确认 BatchAttempt 完成。同一产物重试复用固定 artifact ID；必须持久化交付状态，只有 artifact 与 complete 都确认成功才释放本地槽位。通信失败时保留文件并继续续租，不创建第二个 MATLAB 批次。
-6. 取消与失效：收到 `cancel_batch_attempt_ids` 时终止 MATLAB 进程树，关闭 pool，并在最终 progress/complete 中将每个未终态 Seed 显式报告为 `cancelled`。进度、产物、完成任一写入返回 `410` 时终止该 MATLAB 进程树并停止该租约的一切后续写入；进程失败或租约失效只报告未完成状态和错误，由 Master 恢复为 `pending`。
-7. 重启恢复：启动 MATLAB 后持久化 PID、命令指纹、lease 与 task 路径。仅当 `running` 文件的 batch ID、lease token、task 路径与 MATLAB `-batch` 启动表达式的 SHA-256 指纹均匹配时，重新上报存活 BatchAttempt；恢复期间继续读取 `progress.json` 并调用 progress API。收到取消或 `410` 时也必须终止该恢复 PID 的进程树。无法验证的遗留 MATLAB 必须终止进程树，工作目录保留给 Master 回收，绝不自行重新执行。完成计算而处于交付重试时报告 `phase=delivering`、PID 和 pool workers 为零。
+响应包含 `assignments` 和 `cancel_attempt_ids`。每个 assignment 都有独立的 `attempt_id`、`lease_token`、Seed、算法/问题参数和环境约束。
 
 ## 验收条件
 
-1. 三个 Worker 的 `max_seeds_per_batch` 分别为 10、8、6 时，一个 30 Seed 实验点会被切分到至少两个 Worker，且不存在重复 Seed。
-2. 单个 Worker 一次仅一个 MATLAB 进程和一个 `parpool`，批内 Seed 数不超过 Master 分配数量。
-3. UI 能实时看到每个 Seed 的执行 Worker、FE/MaxFE、百分比、运行时长和 ETA。
-4. 关闭一个 Worker 后，已完成 Seed 不重新执行，其余 Seed 在心跳超时后由其他节点完成。
-5. 取消实验点会停止其所有运行批次且不再分配 pending Seed；取消后不接受旧 lease token 的进度、结果或完成请求。
+1. 40 槽 Worker 可以跨多个 ExperimentPoint 同时运行 40 个 Seed；
+2. 任意单个 Seed 取消不会停止其他 Seed；
+3. Worker 失联后仅未完成 Seed 回到 pending；
+4. 产物上传失败会重试，不会提前确认 completed；
+5. 进度、完成和产物均拒绝旧 lease token；
+6. 多 Worker 不会重复领取同一个 Seed；
+7. Worker 暂停接单只影响新分配，不影响已运行任务。

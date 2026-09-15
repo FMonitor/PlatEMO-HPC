@@ -35,6 +35,12 @@ export const api = {
       body: JSON.stringify({ runs: runs.map(({ pointId, seed }) => ({ experiment_point_id: pointId, seed: Number(seed) })) }),
     },
   ),
+  retrySeedHistories: (runs: Array<{ pointId: string; seed: number | string }>) => request<{ status: string; count: number }>(
+    '/api/v1/seed-runs/history/retry', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ runs: runs.map(({ pointId, seed }) => ({ experiment_point_id: pointId, seed: Number(seed) })) }),
+    },
+  ),
   cancelPoint: (pointId: string) => request<{ status: string }>(`/api/v1/experiment-points/${encodeURIComponent(pointId)}/cancel`, { method: 'POST' }),
   cancelBatch: (batchId: string) => request<{ status: string }>(`/api/v1/batch-attempts/${encodeURIComponent(batchId)}/cancel`, { method: 'POST' }),
   cancelSeedAttempt: (attemptId: string) => request<{ status: string }>(`/api/v2/seed-attempts/${encodeURIComponent(attemptId)}/cancel`, { method: 'POST' }),

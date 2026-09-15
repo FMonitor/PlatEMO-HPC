@@ -65,6 +65,8 @@ const workspaceStyle = computed(() => ({
   '--existing-width': `${columnWidths.value.existing}px`,
 }))
 
+const modalOpen = computed(() => showWorkerForm.value || showPlatemoForm.value)
+
 const catalogStyle = computed(() => ({
   '--algorithm-height': `${catalogHeights.value.algorithms}px`,
   '--problem-height': `${catalogHeights.value.problems}px`,
@@ -145,6 +147,10 @@ watch(error, (message) => {
   error.value = ''
 })
 
+watch(modalOpen, (open) => {
+  if (open) stopResize()
+})
+
 watch([taskHistory, historyPageSize], () => {
   historyPage.value = Math.min(historyPage.value, historyPageCount.value)
 })
@@ -195,6 +201,7 @@ function resize(event: PointerEvent) {
 }
 
 function startColumnResize(target: ColumnResizeTarget, event: PointerEvent) {
+  if (modalOpen.value) return
   event.preventDefault()
   stopResize()
   resizeState.value = { direction: 'column', target, origin: event.clientX, widths: { ...columnWidths.value } }
@@ -204,6 +211,7 @@ function startColumnResize(target: ColumnResizeTarget, event: PointerEvent) {
 }
 
 function startCatalogResize(target: CatalogResizeTarget, event: PointerEvent) {
+  if (modalOpen.value) return
   event.preventDefault()
   stopResize()
   resizeState.value = { direction: 'row', target, origin: event.clientY, heights: { ...catalogHeights.value } }
@@ -658,6 +666,38 @@ async function deleteSelectedTaskHistories() {
   }
 }
 
+async function retryTaskHistory(task: TaskStatus) {
+  const pointId = task.task_id || task.id.split(':')[0]
+  if (!pointId || task.state !== 'failed' || !window.confirm(`重新分配 ${task.problem} Seed ${task.seed}？`)) return
+  busy.value = true
+  try {
+    const result = await api.retrySeedHistories([{ pointId, seed: task.seed }])
+    selectedHistoryKeys.value = selectedHistoryKeys.value.filter((key) => key !== historyTaskKey(task))
+    showNotice(`已重新分配 ${result.count} 条失败任务。`)
+    await loadTasks()
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : '重新分配任务失败'
+  } finally {
+    busy.value = false
+  }
+}
+
+async function retrySelectedTaskHistories() {
+  const selected = taskHistory.value.filter((task) => selectedHistoryKeys.value.includes(historyTaskKey(task)) && task.state === 'failed')
+  if (!selected.length || !window.confirm(`重新分配所选 ${selected.length} 条失败任务？`)) return
+  busy.value = true
+  try {
+    const result = await api.retrySeedHistories(selected.map((task) => ({ pointId: task.task_id || task.id.split(':')[0], seed: task.seed })))
+    selectedHistoryKeys.value = []
+    showNotice(`已重新分配 ${result.count} 条失败任务。`)
+    await loadTasks()
+  } catch (caught) {
+    error.value = caught instanceof Error ? caught.message : '批量重新分配任务失败'
+  } finally {
+    busy.value = false
+  }
+}
+
 function taskProgress(task: TaskStatus) {
   const fe = Number(task.fe)
   const total = Number(task.total_fe)
@@ -776,7 +816,7 @@ onBeforeUnmount(() => {
 
     <section class="task-panel">
       <div class="plan-toolbar"><button class="primary-button" type="button" :disabled="busy" @click="startRun">启动任务</button><button class="outline-button" type="button" :disabled="busy" @click="refreshAll"><RefreshCw :size="16" /> 刷新目录</button></div>
-      <section class="plan-card schedule-card"><div class="schedule-tabs" role="tablist" aria-label="任务队列视图"><button class="schedule-tab" :class="{ active: scheduleView === 'queue' }" type="button" role="tab" :aria-selected="scheduleView === 'queue'" @click="scheduleView = 'queue'">计划分配 <small>{{ pendingTasks.length }}</small></button><button class="schedule-tab" :class="{ active: scheduleView === 'history' }" type="button" role="tab" :aria-selected="scheduleView === 'history'" @click="scheduleView = 'history'">任务记录 <small>{{ taskHistory.length }}</small></button><span class="panel-actions"><button v-if="scheduleView === 'queue'" class="icon-button" type="button" :title="queueExpanded ? '收起待分配列表' : '展开待分配列表'" @click="queueExpanded = !queueExpanded"><ChevronUp v-if="queueExpanded" :size="16" /><ChevronDown v-else :size="16" /></button><button v-else class="icon-button" type="button" :title="historyExpanded ? '收起任务记录' : '展开任务记录'" @click="historyExpanded = !historyExpanded"><ChevronUp v-if="historyExpanded" :size="16" /><ChevronDown v-else :size="16" /></button><button class="text-button" type="button" :disabled="busy" @click="toggleDispatchPause()">{{ dispatchPaused ? '恢复分配' : '暂停分配' }}</button><button class="text-button danger" type="button" :disabled="busy" @click="cancelAllTasks">取消所有任务</button></span></div><div class="plan-metrics-inline"><span><strong>{{ pendingTasks.length }}</strong> 待分配</span><i aria-hidden="true"></i><span><strong>{{ claimedTaskCount }}</strong> 已接取</span><i aria-hidden="true"></i><span><strong>{{ runningTaskCount }}</strong> 运行中</span><i aria-hidden="true"></i><span><strong>{{ availableWorkerCount }}</strong> 可接单节点</span></div><div v-if="scheduleView === 'queue' && queueExpanded" class="assignment-list"><div class="list-toolbar"><span>第 {{ queuePage }} / {{ queuePageCount }} 页，共 {{ pendingTasks.length }} 条</span><span class="panel-actions"><label>每页 <select v-model.number="queuePageSize"><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option><option :value="500">500</option></select> 条</label></span></div><div v-for="task in pagedPendingTasks" :key="task.id" class="assignment-row"><div class="assignment-main"><strong>{{ task.problem }}</strong><span>{{ task.algorithm }}</span><small>{{ parameterSummary(task) }}</small></div><div class="assignment-actions"><button class="text-button danger" type="button" :disabled="busy" @click="cancelPendingTask(task)">取消</button></div></div><div v-if="pendingTasks.length" class="history-pagination"><button class="icon-button" type="button" title="上一页" :disabled="queuePage <= 1" @click="queuePage -= 1">‹</button><span>第 {{ queuePage }} / {{ queuePageCount }} 页，共 {{ pendingTasks.length }} 条</span><button class="icon-button" type="button" title="下一页" :disabled="queuePage >= queuePageCount" @click="queuePage += 1">›</button></div><p v-if="!pendingTasks.length" class="empty-text">当前没有待分配任务。</p></div><div v-else-if="scheduleView === 'history' && historyExpanded" class="task-history-list"><div class="list-toolbar"><label><input type="checkbox" :checked="currentPageHistorySelected" :disabled="!pagedTaskHistory.length || busy" @change="toggleCurrentHistoryPage"> 全选当前页</label><span class="panel-actions"><label>每页 <select v-model.number="historyPageSize"><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option><option :value="500">500</option></select> 条</label><button v-if="selectedHistoryKeys.length" class="text-button danger" type="button" :disabled="busy" @click="deleteSelectedTaskHistories">删除所选 ({{ selectedHistoryKeys.length }})</button></span></div><article v-for="task in pagedTaskHistory" :key="task.id" class="task-history-row"><input v-model="selectedHistoryKeys" type="checkbox" :value="historyTaskKey(task)" :disabled="busy" :aria-label="`选择 ${task.problem} Seed ${task.seed}`"><span class="task-state-dot" :class="task.state"></span><strong>{{ task.problem }}</strong><span>{{ task.algorithm }}</span><small>Seed {{ task.seed }} · {{ taskStateLabel(task) }} · {{ task.updated_at }}</small><button class="icon-button danger" type="button" title="删除任务记录" :disabled="busy" @click="deleteTaskHistory(task)"><Trash2 :size="15" /></button></article><div v-if="taskHistory.length" class="history-pagination"><button class="icon-button" type="button" title="上一页" :disabled="historyPage <= 1" @click="historyPage -= 1">‹</button><span>第 {{ historyPage }} / {{ historyPageCount }} 页，共 {{ taskHistory.length }} 条</span><button class="icon-button" type="button" title="下一页" :disabled="historyPage >= historyPageCount" @click="historyPage += 1">›</button></div><p v-if="!taskHistory.length" class="empty-text">完成和失败的任务将在此保留记录。</p></div></section>
+      <section class="plan-card schedule-card"><div class="schedule-tabs" role="tablist" aria-label="任务队列视图"><button class="schedule-tab" :class="{ active: scheduleView === 'queue' }" type="button" role="tab" :aria-selected="scheduleView === 'queue'" @click="scheduleView = 'queue'">计划分配 <small>{{ pendingTasks.length }}</small></button><button class="schedule-tab" :class="{ active: scheduleView === 'history' }" type="button" role="tab" :aria-selected="scheduleView === 'history'" @click="scheduleView = 'history'">任务记录 <small>{{ taskHistory.length }}</small></button><span class="panel-actions"><button v-if="scheduleView === 'queue'" class="icon-button" type="button" :title="queueExpanded ? '收起待分配列表' : '展开待分配列表'" @click="queueExpanded = !queueExpanded"><ChevronUp v-if="queueExpanded" :size="16" /><ChevronDown v-else :size="16" /></button><button v-else class="icon-button" type="button" :title="historyExpanded ? '收起任务记录' : '展开任务记录'" @click="historyExpanded = !historyExpanded"><ChevronUp v-if="historyExpanded" :size="16" /><ChevronDown v-else :size="16" /></button><button class="text-button" type="button" :disabled="busy" @click="toggleDispatchPause()">{{ dispatchPaused ? '恢复分配' : '暂停分配' }}</button><button class="text-button danger" type="button" :disabled="busy" @click="cancelAllTasks">取消所有任务</button></span></div><div class="plan-metrics-inline"><span><strong>{{ pendingTasks.length }}</strong> 待分配</span><i aria-hidden="true"></i><span><strong>{{ claimedTaskCount }}</strong> 已接取</span><i aria-hidden="true"></i><span><strong>{{ runningTaskCount }}</strong> 运行中</span><i aria-hidden="true"></i><span><strong>{{ availableWorkerCount }}</strong> 可接单节点</span></div><div v-if="scheduleView === 'queue' && queueExpanded" class="assignment-list"><div class="list-toolbar"><span>第 {{ queuePage }} / {{ queuePageCount }} 页，共 {{ pendingTasks.length }} 条</span><span class="panel-actions"><label>每页 <select v-model.number="queuePageSize"><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option><option :value="500">500</option></select> 条</label></span></div><div v-for="task in pagedPendingTasks" :key="task.id" class="assignment-row"><div class="assignment-main"><strong>{{ task.problem }}</strong><span>{{ task.algorithm }}</span><small>{{ parameterSummary(task) }}</small></div><div class="assignment-actions"><button class="text-button danger" type="button" :disabled="busy" @click="cancelPendingTask(task)">取消</button></div></div><div v-if="pendingTasks.length" class="history-pagination"><button class="icon-button" type="button" title="上一页" :disabled="queuePage <= 1" @click="queuePage -= 1">‹</button><span>第 {{ queuePage }} / {{ queuePageCount }} 页，共 {{ pendingTasks.length }} 条</span><button class="icon-button" type="button" title="下一页" :disabled="queuePage >= queuePageCount" @click="queuePage += 1">›</button></div><p v-if="!pendingTasks.length" class="empty-text">当前没有待分配任务。</p></div><div v-else-if="scheduleView === 'history' && historyExpanded" class="task-history-list"><div class="list-toolbar"><label><input type="checkbox" :checked="currentPageHistorySelected" :disabled="!pagedTaskHistory.length || busy" @change="toggleCurrentHistoryPage"> 全选当前页</label><span class="panel-actions"><label>每页 <select v-model.number="historyPageSize"><option :value="20">20</option><option :value="50">50</option><option :value="100">100</option><option :value="500">500</option></select> 条</label><button v-if="selectedHistoryKeys.length && taskHistory.some((task) => selectedHistoryKeys.includes(historyTaskKey(task)) && task.state === 'failed')" class="text-button" type="button" :disabled="busy" @click="retrySelectedTaskHistories">重新分配失败任务</button><button v-if="selectedHistoryKeys.length" class="text-button danger" type="button" :disabled="busy" @click="deleteSelectedTaskHistories">删除所选 ({{ selectedHistoryKeys.length }})</button></span></div><article v-for="task in pagedTaskHistory" :key="task.id" class="task-history-row"><input v-model="selectedHistoryKeys" type="checkbox" :value="historyTaskKey(task)" :disabled="busy" :aria-label="`选择 ${task.problem} Seed ${task.seed}`"><span class="task-state-dot" :class="task.state"></span><strong>{{ task.problem }}</strong><span>{{ task.algorithm }}</span><small>Seed {{ task.seed }} · {{ taskStateLabel(task) }} · {{ task.updated_at }}</small><button v-if="task.state === 'failed'" class="text-button" type="button" :disabled="busy" @click="retryTaskHistory(task)">重试</button><button class="icon-button danger" type="button" title="删除任务记录" :disabled="busy" @click="deleteTaskHistory(task)"><Trash2 :size="15" /></button></article><div v-if="taskHistory.length" class="history-pagination"><button class="icon-button" type="button" title="上一页" :disabled="historyPage <= 1" @click="historyPage -= 1">‹</button><span>第 {{ historyPage }} / {{ historyPageCount }} 页，共 {{ taskHistory.length }} 条</span><button class="icon-button" type="button" title="下一页" :disabled="historyPage >= historyPageCount" @click="historyPage += 1">›</button></div><p v-if="!taskHistory.length" class="empty-text">完成和失败的任务将在此保留记录。</p></div></section>
       <section class="plan-card task-card"><h2 class="panel-heading">Seed 运行 <small>{{ activeTaskCount }} 个活动任务</small><span class="panel-actions"><button class="text-button danger" type="button" :disabled="busy" @click="cancelAllTasks">停止所有任务</button></span></h2><div class="task-list"><article v-for="task in seedRunTasks" :key="task.id" class="task-row"><div class="task-node"><span class="task-state-dot" :class="task.state"></span><strong>{{ task.worker_name }}</strong><span>{{ taskStateLabel(task) }}</span><button v-if="isCancellableTask(task)" class="icon-button task-cancel" type="button" :title="task.attempt_kind === 'dynamic_seed' ? '取消此 Seed' : '取消此 Worker 批次'" :disabled="busy" @click="cancelTaskBatch(task)"><CircleStop :size="16" /></button></div><div class="task-run"><div class="task-identifiers"><strong>{{ task.problem }}</strong><span>{{ task.algorithm }}</span></div><div class="progress-track" :aria-label="taskFeLabel(task)"><i :style="{ width: `${taskProgress(task)}%` }"></i></div><div class="task-metrics"><strong>{{ taskFeLabel(task) }}</strong><span>{{ taskProgress(task) }}%</span><small>运行 {{ formatDuration(task.elapsed_seconds) }}</small><small>{{ taskEtaLabel(task) }}</small></div></div><div class="task-meta">Seed {{ task.seed }} · N{{ taskParameter(task, 'N') }} · M{{ taskParameter(task, 'M') }} · D{{ taskParameter(task, 'D') }}</div></article><p v-if="!seedRunTasks.length" class="empty-text">Worker 领取任务后将在此显示每个 Seed 的分配和进度。</p></div></section>
     </section>
     <div class="column-resizer" title="拖拽调整已有数据列宽度" @pointerdown="startColumnResize('existing', $event)"><span></span></div>

@@ -34,7 +34,7 @@ Worker 每 2 秒发送 `POST /api/v2/workers/{worker_id}/heartbeat`：
 }
 ```
 
-Master 在同一短 SQLite 事务内续租 `running_seeds`，并最多返回 `free_seed_slots` 个 `assignments`。每个 assignment 是单个 Seed 的完整参数快照，包含独立 `attempt_id`、`lease_token`、`experiment_point_id`、算法、问题、N/M/D/maxFE、自定义参数、Settings 摘要和环境约束。
+Master 在同一短 SQLite 事务内续租 `running_seeds`，并最多返回 `free_seed_slots` 个 `assignments`。每个 assignment 包含独立 `attempt_id`、`lease_token`、`experiment_point_id`、算法/问题名称、N/M/D/maxFE、自定义参数、Settings 摘要和环境约束；算法/问题的完整参数对象不重复下发，显式有序参数数组是唯一调用参数源。
 
 选择规则：只选择 Worker 兼容、未暂停、未取消的 pending Seed；允许不同算法和问题混合，但每个 Seed 单独校验 Profile、PlatEMO commit、磁盘下限和 Settings。Master 不按实验点的运行次数限制一次会话的装填量。
 
@@ -42,15 +42,17 @@ Master 在同一短 SQLite 事务内续租 `running_seeds`，并最多返回 `fr
 
 ## Worker 与 MATLAB
 
-Worker 启动后先探测 Profile，再启动 MATLAB Supervisor。Supervisor 创建一次 `parpool(profile)`，使用 `parfeval` 为每个 assignment 提交一个独立运行函数。它从 Worker 本地 inbox 读取新 assignment，完成时向 outbox 写入：
+Worker 启动后先探测 Profile，再启动 MATLAB Supervisor。Supervisor 创建一次 `parpool(profile)`，并将支持该属性的 MATLAB 版本的 `IdleTimeout` 设为 `Inf`。每次从 inbox 取任务前以及每次 `parfeval` 提交前都检查池对象是否仍有效；若本机 Profile 因空闲超时或其他原因关闭，Supervisor 自动重建池、刷新 `session.json`，并保留尚未成功提交的 inbox 文件重试，不把暂时的池故障报告为 Seed 失败。它使用 `parfeval` 为每个 assignment 提交一个独立运行函数。它从 Worker 本地 inbox 读取新 assignment，完成时向 outbox 写入：
 
 - `started`、FE、耗时和当前实际池大小；
 - `completed` / `failed` / `cancelled`；
 - `runs/<attempt_id>.mat` 的稳定文件路径。
 
-Worker 负责把 outbox 的进度上报给 Master。确认 MAT 文件已关闭后立即上传，使用单一上传队列限制并发（默认 `1`），以错峰磁盘和网络 I/O。MATLAB future 结束即释放计算槽位，Worker 可立即领取替补 Seed；原 Seed 转为 `delivering`，继续在心跳中续租，直至 artifact 与 complete 都被 Master 确认。交付重试不占用 MATLAB 槽位。
+Worker 负责把 outbox 的进度上报给 Master。每个 Seed 只保留一个可覆盖的 `*.progress.json` 快照，进度上报使用独立队列并按 Seed 合并/串行发送，不能阻塞 Worker 心跳；确认 MAT 文件已关闭后立即上传，使用单一交付队列限制并发（默认 `1`），以错峰磁盘和网络 I/O。MATLAB future 结束即释放计算槽位，Worker 可立即领取替补 Seed；原 Seed 转为 `delivering`，继续在心跳中续租，直至 artifact 与 complete 都被 Master 确认。交付重试不占用 MATLAB 槽位。Master 确认完成后，Worker 删除本地进度快照和已上传 MAT，仅保留必要日志与任务审计元数据。
 
-MATLAB Supervisor 或 Worker 重启时：先验证 PID 与 session 记录；不能验证则终止遗留进程树，并由 Master 回收未续租计算 Seed。Worker 必须从 durable outbox 恢复 `delivering` Seed，并以相同 `(worker_id, lease_token)` 让 Master 将该 Seed 重新绑定到新 `session_id`，持续续租直到上传完成。已上传的 MAT 不重算。
+Seed MAT 使用 MATLAB v7 传统 PlatEMO 格式，包含变量 `result` 和 `metric`；任务快照和交付元数据由 Worker 的 JSON/outbox/API 记录承载，不写入上传 MAT。
+
+MATLAB Supervisor 或 Worker 重启时：先验证 PID 与 session 记录；不能验证则终止遗留进程树，并由 Master 回收未续租计算 Seed。Worker 必须从 durable outbox 恢复 `delivering` Seed，并使用原 attempt 和 lease 继续交付；租约仍有效时继续续租，租约失效时停止写入并等待 Master 重分配。已上传的 MAT 不重算。
 
 ## Master 存储与性能
 
@@ -58,8 +60,7 @@ MATLAB Supervisor 或 Worker 重启时：先验证 PID 与 session 记录；不�
 
 ## 迁移顺序
 
-1. 增加 v2 Session/SeedAttempt 表和端点，不修改现有 v1 Batch 路径。
-2. Worker 固定使用 Supervisor 模式，不再通过配置项切换旧 Batch 模式。
-3. 前端显示“实际池/配置池”“运行 Seed/空闲槽位”和 Session 状态。
-4. 在单 Worker、40 槽位、每点 30 Seed 的场景验证跨实验点补位、逐 Seed 上传、网络断连恢复和取消。
-5. 验收后将默认执行模式切为动态会话；历史 BatchAttempt 保持只读直至清理窗口结束。
+1. 当前 Worker 固定使用 Supervisor 模式，V1 接口仅保留 410 退役响应。
+2. 前端显示“实际池/配置池”“运行 Seed/空闲槽位”和 Session 状态。
+3. 在单 Worker、40 槽位、每点 30 Seed 的场景验证跨实验点补位、逐 Seed 上传、网络断连恢复和取消。
+4. 历史 BatchAttempt 仅用于只读审计和清理窗口内的交付处理。

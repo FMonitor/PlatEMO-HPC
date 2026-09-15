@@ -33,8 +33,11 @@ class DynamicSession:
         self.process: asyncio.subprocess.Process | None = None
         self.running: dict[str, dict[str, Any]] = {}
         self.queued_delivery_paths: set[Path] = set()
+        self.queued_progress_attempts: set[str] = set()
         self.upload_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.progress_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.upload_task: asyncio.Task[None] | None = None
+        self.progress_task: asyncio.Task[None] | None = None
         self.process_log_handle: Any | None = None
         self.next_start_at = 0.0
         self.start_backoff_seconds = 5.0
@@ -120,6 +123,8 @@ class DynamicSession:
     async def stop(self) -> None:
         if self.upload_task:
             self.upload_task.cancel()
+        if self.progress_task:
+            self.progress_task.cancel()
         if self.process and self.process.returncode is None:
             await self.state._terminate_process(self.process)
         if self.process_log_handle:
@@ -134,8 +139,11 @@ class DynamicSession:
     async def run(self) -> None:
         if self.upload_task is None or self.upload_task.done():
             self.upload_task = asyncio.create_task(self._upload_loop())
+        if self.progress_task is None or self.progress_task.done():
+            self.progress_task = asyncio.create_task(self._progress_loop())
         while True:
             self.state.schedule_pool_capacity_probe()
+            self._prune_outbox()
             try:
                 # Dynamic mode still uses the common join-token registration
                 # path when a node token has not been persisted yet.
@@ -148,6 +156,18 @@ class DynamicSession:
             await self._consume_outbox()
             await self._heartbeat()
             await asyncio.sleep(2)
+
+    def _prune_outbox(self) -> None:
+        """Remove only disposable delivery debris; keep retryable JSON and MATs."""
+        cutoff = time.time() - 24 * 60 * 60
+        tmp_cutoff = time.time() - 60 * 60
+        for pattern, limit in (("*.invalidated", cutoff), ("*.cancel", cutoff), ("*.tmp", tmp_cutoff)):
+            for path in self.outbox.glob(pattern):
+                try:
+                    if path.stat().st_mtime < limit:
+                        path.unlink(missing_ok=True)
+                except OSError:
+                    continue
 
     async def _heartbeat(self) -> None:
         if not self.state.node_token:
@@ -257,7 +277,72 @@ class DynamicSession:
                 self.queued_delivery_paths.add(path)
                 await self.upload_queue.put(event)
             else:
-                path.unlink(missing_ok=True)
+                # Keep progress off the heartbeat loop.  A Seed can emit many
+                # progress files; waiting for each HTTP request here would let
+                # the 30-second lease expire while the worker is otherwise
+                # healthy.  The progress worker sends at most one queued event
+                # per Seed at a time and retries durable files.
+                if attempt_id not in self.queued_progress_attempts:
+                    self.queued_progress_attempts.add(attempt_id)
+                    event["_event_path"] = str(path)
+                    await self.progress_queue.put(event)
+
+    async def _send_seed_progress(self, event: dict[str, Any]) -> None:
+        """Send one durable MATLAB progress event to the V2 Seed endpoint."""
+        base = self.state.config["master_url"].rstrip("/")
+        payload = {
+            "lease_token": event["lease_token"],
+            "state": "running",
+            "fe": event.get("fe", 0),
+            "total_fe": event.get("total_fe", 0),
+            "elapsed_seconds": event.get("elapsed_seconds", 0),
+            "error": event.get("error", ""),
+        }
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.post(
+                f"{base}/api/v2/seed-attempts/{event['attempt_id']}/progress",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.state.node_token}"},
+            )
+            response.raise_for_status()
+
+    async def _progress_loop(self) -> None:
+        while True:
+            event = await self.progress_queue.get()
+            attempt_id = str(event.get("attempt_id", ""))
+            path = Path(str(event.get("_event_path", "")))
+            try:
+                while True:
+                    if not path.is_file():
+                        break
+                    try:
+                        # A newer snapshot may have replaced this file while
+                        # the event was waiting in the queue. Read it just
+                        # before sending so we never report stale FE and do
+                        # not need one file per progress callback.
+                        try:
+                            latest = json.loads(path.read_text(encoding="utf-8"))
+                            latest["_event_path"] = str(path)
+                            event = latest
+                        except (OSError, json.JSONDecodeError):
+                            pass
+                        await self._send_seed_progress(event)
+                        path.unlink(missing_ok=True)
+                        break
+                    except httpx.HTTPStatusError as exc:
+                        if exc.response.status_code == 410:
+                            self.log.warning("dynamic Seed progress invalidated attempt=%s", attempt_id)
+                            if path.is_file():
+                                path.replace(path.with_suffix(".invalidated"))
+                            await self._cancel(attempt_id)
+                            break
+                        self.log.warning("dynamic Seed progress failed attempt=%s status=%s; retrying", attempt_id, exc.response.status_code)
+                    except (OSError, httpx.HTTPError) as exc:
+                        self.log.warning("dynamic Seed progress unavailable attempt=%s; retrying: %s", attempt_id, exc)
+                    await asyncio.sleep(5)
+            finally:
+                self.queued_progress_attempts.discard(attempt_id)
+                self.progress_queue.task_done()
 
     async def _upload_loop(self) -> None:
         while True:
@@ -268,6 +353,16 @@ class DynamicSession:
                         await self._deliver(event)
                         event_path = Path(str(event.get("_event_path", "")))
                         event_path.unlink(missing_ok=True)
+                        Path(str(event.get("_event_path", ""))).with_name(
+                            f"{event.get('attempt_id', '')}.progress.json"
+                        ).unlink(missing_ok=True)
+                        # Master has durably stored the result. The local MAT
+                        # is no longer needed for retry and is the largest
+                        # per-Seed file in the Worker data directory.
+                        if event.get("state") == "completed":
+                            artifact = event.get("artifact_path")
+                            if artifact:
+                                Path(str(artifact)).unlink(missing_ok=True)
                         self.queued_delivery_paths.discard(event_path)
                         self.running.pop(str(event.get("attempt_id", "")), None)
                         break

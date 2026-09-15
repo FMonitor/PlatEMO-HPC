@@ -1,6 +1,7 @@
 """Regression coverage for durable dynamic Seed delivery state."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import tempfile
@@ -47,6 +48,46 @@ class DynamicSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(queued["attempt_id"], "attempt-1")
         self.assertEqual(queued["phase"], "delivering")
         self.session.upload_queue.task_done()
+
+    async def test_running_outbox_event_reports_v2_progress(self) -> None:
+        event = {
+            "attempt_id": "attempt-progress", "lease_token": "lease", "experiment_point_id": "point",
+            "seed": 3, "state": "running", "fe": 120, "total_fe": 1000,
+            "elapsed_seconds": 8, "error": "",
+        }
+        path = self.session.outbox / "attempt-progress.json"
+        path.write_text(json.dumps(event), encoding="utf-8")
+
+        class Response:
+            def raise_for_status(self) -> None:
+                return None
+
+        class Client:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict]] = []
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return None
+
+            async def post(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return Response()
+
+        client = Client()
+        with patch("platemo_worker.dynamic_session.httpx.AsyncClient", return_value=client):
+            progress_task = asyncio.create_task(self.session._progress_loop())
+            await self.session._consume_outbox()
+            await asyncio.wait_for(self.session.progress_queue.join(), timeout=1)
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+
+        self.assertFalse(path.exists())
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("/api/v2/seed-attempts/attempt-progress/progress", client.calls[0][0])
+        self.assertEqual(client.calls[0][1]["json"]["fe"], 120)
 
     async def test_delivery_does_not_consume_a_computing_slot(self) -> None:
         self.session.running = {
